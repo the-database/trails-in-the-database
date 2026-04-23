@@ -1,12 +1,18 @@
-"""Extract Trails through Daybreak 2 (game 12) dialogue into db2.sql.
+"""Extract Trails beyond the Horizon (game 13) dialogue into horizon.sql.
 
-Parses .ing files decompiled from the game's ED9 scripts. Dialogue is
-expressed as `system[5,6](chrId, ..., text, ...)` calls with text lines
-inline; speaker-name overrides use `chr_set_display_name(chrId, "name")`.
-Each top-level `fn name()` is a scene. Line-number labels (`NNN@`) are
-stripped before parsing. Each interesting call is extracted with balanced-
-paren scanning and parsed via `ast.parse` (the calls themselves are valid
+Parses .ing files decompiled by Ingert. Dialogue is expressed as
+`system[5,6](chrId, ..., text, ...)` calls with text lines inline;
+speaker-name overrides use `chr_set_display_name(chrId, "name")`. Each
+top-level `fn name()` is a scene. Line-number labels (`NNN@`) are stripped
+before parsing. Each interesting call is extracted with balanced-paren
+scanning and parsed via `ast.parse` (the calls themselves are valid
 Python once labels are stripped).
+
+Format is identical to game 12 (db2) — differences from db2:
+  - EN/JP script roots: `horizon.ing/script_eng`, `horizon.ing/script`
+  - Portrait inventory: no noteface tier (0 files in horizon itp)
+  - Portrait variant priority: _c15 > _c10 > bare > other
+  - Speaker names trimmed (horizon t_name has stray trailing spaces)
 """
 
 import ast
@@ -15,131 +21,166 @@ import os
 import re
 import sys
 
-DB2_ROOT = os.path.join(os.path.expanduser('~'), 'Documents', 'programming', 'KuroTools', 'daybreak2_extract')
-EN_ROOT = os.path.join(DB2_ROOT, 'en.ing', 'script_en')
-JP_ROOT = os.path.join(DB2_ROOT, 'jp.ing', 'script')
-EN_TNAME = os.path.join(DB2_ROOT, 'en_json', 't_name.json')
-JP_TNAME = os.path.join(DB2_ROOT, 'jp_json', 't_name.json')
-JP_TVOICE = os.path.join(DB2_ROOT, 'jp_json', 't_voice.json')
-GAME_ID = 12
-OUTPUT = 'db2.sql'
+HORIZON_SCRIPT_ROOT = os.path.join(os.path.expanduser('~'), 'Documents', 'programming', 'Ingert', 'data', 'horizon.ing')
+HORIZON_TBL_ROOT = os.path.join(os.path.expanduser('~'), 'Documents', 'programming', 'KuroTools', 'horizon_extract')
+EN_ROOT = os.path.join(HORIZON_SCRIPT_ROOT, 'script_eng')
+JP_ROOT = os.path.join(HORIZON_SCRIPT_ROOT, 'script')
+EN_TNAME = os.path.join(HORIZON_TBL_ROOT, 'en_json', 't_name.json')
+JP_TNAME = os.path.join(HORIZON_TBL_ROOT, 'jp_json', 't_name.json')
+JP_TVOICE = os.path.join(HORIZON_TBL_ROOT, 'jp_json', 't_voice.json')
+GAME_ID = 13
+OUTPUT = 'horizon.sql'
 
-# 0xFFFE / 0xFFFF are engine sentinels for anonymous narration. t_name.json
-# has a stray entry mapping 65535 to "Overlord Auguste"/chr0298, so looking
-# up these chrIds would incorrectly attribute pure-narration lines. Skip
-# the name and portrait lookup for these; latched overrides still apply.
+# 0xFFFE / 0xFFFF are engine sentinels for anonymous narration. horizon's
+# t_name has a stray entry mapping 65535 to "Overlord Auguste"/chr0298.
+# Skip the name and portrait lookup for these; latched overrides still apply.
 ANONYMOUS_CHR_IDS = frozenset({0xFFFE, 0xFFFF})
 
-# Subdirs under the script root that contain real dialogue. `battle`,
-# `obj`, `ai` have zero `system[5,6]` calls and are skipped.
+# Subdirs under each script root that contain real dialogue. `battle`,
+# `obj`, `ai`, `demo` have zero `system[5,6]` calls and are skipped.
 DIALOGUE_SUBDIRS = ('scena', 'cutscene', 'minigame', 'ani')
 
-# Full face portraits (39 files in image_portraits/*.dds — converted to webp).
+# Full face portraits (55 files in itp/*.dds — converted to webp).
 AVAILABLE_PORTRAITS = {
-    'avfc0000.webp', 'avfc0002.webp', 'avfc0004.webp', 'avfc0006.webp',
-    'avfc0009.webp', 'avfc0111.webp', 'avfc0112.webp', 'avfc0113.webp',
-    'avfc0120.webp', 'avfc0120_c03.webp',
+    'avfc0000.webp', 'avfc0000_c15.webp',
+    'avfc0002.webp', 'avfc0002_c15.webp',
+    'avfc0004.webp', 'avfc0004_c15.webp',
+    'avfc0006.webp', 'avfc0009.webp',
+    'avfc0111.webp', 'avfc0112.webp', 'avfc0113.webp',
+    'avfc0118.webp', 'avfc0120.webp', 'avfc0120_c03.webp',
+    'avfc0123.webp', 'avfc0124.webp', 'avfc0125.webp', 'avfc0126.webp',
     'avfc0301.webp', 'avfc0303.webp', 'avfc0304.webp', 'avfc0306.webp',
-    'avfc5001.webp', 'avfc5001_c03.webp', 'avfc5001_c10.webp',
-    'avfc5003.webp', 'avfc5005.webp',
-    'avfc5007.webp', 'avfc5007_c03.webp', 'avfc5008.webp',
-    'avfc5009_00.webp',
-    'avfc5110.webp', 'avfc5110_c10.webp', 'avfc5112.webp', 'avfc5113.webp',
-    'avfc5113_c00.webp',
+    'avfc5001.webp', 'avfc5001_c03.webp', 'avfc5001_c10.webp', 'avfc5001_c15.webp',
+    'avfc5003.webp', 'avfc5003_c15.webp',
+    'avfc5005.webp', 'avfc5005_c15.webp',
+    'avfc5007.webp', 'avfc5007_c03.webp', 'avfc5007_c15.webp',
+    'avfc5008.webp', 'avfc5009.webp', 'avfc5009_00.webp',
+    'avfc5110.webp', 'avfc5110_c10.webp', 'avfc5110_c15.webp',
+    'avfc5112.webp', 'avfc5112_c00.webp',
+    'avfc5113.webp', 'avfc5113_c00.webp',
     'avfc5114.webp', 'avfc5114_c10.webp',
     'avfc5117.webp', 'avfc5117_c10.webp',
     'avfc5118.webp', 'avfc5119.webp', 'avfc5119_c03.webp',
-    'avfc5302.webp',
-    'avfcamio.webp', 'avfcarabia.webp', 'avfcelis.webp',
+    'avfc5120.webp', 'avfc5121.webp', 'avfc5122.webp',
+    'avfc5302.webp', 'avfc5327.webp',
 }
 
-# Small note icons (19 base files; _s shadow companions are not speaker icons).
-AVAILABLE_NOTES = {
-    'noteface_c0000.webp', 'noteface_c0002.webp', 'noteface_c0004.webp',
-    'noteface_c0112.webp', 'noteface_c0120.webp', 'noteface_c0306.webp',
-    'noteface_c5001.webp', 'noteface_c5003.webp', 'noteface_c5005.webp',
-    'noteface_c5007.webp', 'noteface_c5110.webp', 'noteface_c5114.webp',
-    'noteface_c5117.webp', 'noteface_c5119.webp', 'noteface_c5302.webp',
-    'noteface_c5311.webp', 'noteface_c5313.webp', 'noteface_c5315.webp',
-    'noteface_c5324.webp',
-}
-
-# Battle faces (159 files) — last-resort fallback.
+# Battle faces (243 files) — fallback when no avfc matches.
 AVAILABLE_BTLFACE = {
-    'btlface0_c0000.webp', 'btlface0_c0002.webp', 'btlface0_c0002_1.webp',
-    'btlface0_c0004.webp', 'btlface0_c0004_c49.webp',
+    'btlface0_c0000.webp', 'btlface0_c0000_c15.webp',
+    'btlface0_c0002.webp', 'btlface0_c0002_1.webp', 'btlface0_c0002_c15.webp',
+    'btlface0_c0004.webp', 'btlface0_c0004_c15.webp', 'btlface0_c0004_c49.webp',
     'btlface0_c0006.webp', 'btlface0_c0009.webp', 'btlface0_c0009_c00.webp',
-    'btlface0_c0010.webp', 'btlface0_c0111.webp', 'btlface0_c0112.webp',
-    'btlface0_c0113.webp', 'btlface0_c0114.webp',
+    'btlface0_c0010.webp', 'btlface0_c0010_c00.webp', 'btlface0_c0011.webp',
+    'btlface0_c0111.webp', 'btlface0_c0112.webp', 'btlface0_c0113.webp',
+    'btlface0_c0114.webp', 'btlface0_c0114_c10.webp',
     'btlface0_c0115.webp', 'btlface0_c0115_c00.webp', 'btlface0_c0115_c02.webp',
+    'btlface0_c0115_c10.webp', 'btlface0_c0115_c10b.webp',
     'btlface0_c0116.webp', 'btlface0_c0116_c02.webp',
     'btlface0_c0117.webp', 'btlface0_c0117_c00.webp',
     'btlface0_c0118.webp',
     'btlface0_c0120.webp', 'btlface0_c0120_c03.webp',
     'btlface0_c0121.webp', 'btlface0_c0121_c00.webp',
     'btlface0_c0122.webp', 'btlface0_c0122_c00.webp',
+    'btlface0_c0122_c10.webp', 'btlface0_c0122_c11.webp',
+    'btlface0_c0123.webp', 'btlface0_c0124.webp', 'btlface0_c0125.webp',
+    'btlface0_c0126.webp', 'btlface0_c0127.webp', 'btlface0_c0127_1.webp',
+    'btlface0_c0127_2.webp', 'btlface0_c0129.webp',
+    'btlface0_c0130.webp', 'btlface0_c0130_c10.webp',
     'btlface0_c0298.webp', 'btlface0_c0299.webp',
     'btlface0_c0300.webp', 'btlface0_c0301.webp',
     'btlface0_c0302.webp', 'btlface0_c0302_1.webp',
-    'btlface0_c0303.webp', 'btlface0_c0304.webp',
+    'btlface0_c0303.webp', 'btlface0_c0304.webp', 'btlface0_c0304_c00.webp',
     'btlface0_c0305_c00.webp', 'btlface0_c0305_c01.webp',
-    'btlface0_c0306.webp', 'btlface0_c0316.webp', 'btlface0_c0317.webp',
-    'btlface0_c0318.webp', 'btlface0_c0328.webp', 'btlface0_c0329.webp',
-    'btlface0_c0330_c00.webp',
-    'btlface0_c0334.webp', 'btlface0_c0409.webp',
-    'btlface0_c0490.webp', 'btlface0_c0500.webp', 'btlface0_c0501.webp',
-    'btlface0_c0503.webp', 'btlface0_c0510a.webp', 'btlface0_c0550a.webp',
-    'btlface0_c0551.webp',
+    'btlface0_c0306.webp',
+    'btlface0_c0307.webp', 'btlface0_c0307_c99.webp',
+    'btlface0_c0311_c10.webp', 'btlface0_c0314.webp',
+    'btlface0_c0316.webp', 'btlface0_c0317.webp', 'btlface0_c0318.webp',
+    'btlface0_c0328.webp', 'btlface0_c0329.webp',
+    'btlface0_c0330_c00.webp', 'btlface0_c0334.webp', 'btlface0_c0336.webp',
+    'btlface0_c0409.webp', 'btlface0_c0426.webp',
+    'btlface0_c0443.webp', 'btlface0_c0446.webp', 'btlface0_c0490.webp',
+    'btlface0_c0500.webp', 'btlface0_c0501.webp', 'btlface0_c0503.webp',
+    'btlface0_c0510a.webp', 'btlface0_c0549.webp',
+    'btlface0_c0550a.webp', 'btlface0_c0551.webp',
     'btlface0_c0660_c01a.webp', 'btlface0_c0665_c01.webp',
-    'btlface0_c0711_c01.webp', 'btlface0_c0712.webp', 'btlface0_c0712a.webp',
+    'btlface0_c0668_c03.webp', 'btlface0_c0711_c01.webp',
+    'btlface0_c0712.webp', 'btlface0_c0712a.webp',
     'btlface0_c0725.webp', 'btlface0_c0725_c01.webp',
     'btlface0_c0725_c02.webp', 'btlface0_c0725_c03.webp',
-    'btlface0_c0726.webp', 'btlface0_c0726_c01.webp',
+    'btlface0_c0726.webp', 'btlface0_c0726_40s.webp',
+    'btlface0_c0726_c01.webp', 'btlface0_c0726_c01_40s.webp',
+    'btlface0_c0726_c01_e.webp', 'btlface0_c0726_e.webp',
     'btlface0_c0727.webp', 'btlface0_c0727_c01.webp',
+    'btlface0_c0728.webp', 'btlface0_c0728_c01.webp',
     'btlface0_c0731_c01.webp', 'btlface0_c0750.webp', 'btlface0_c0755.webp',
     'btlface0_c0757.webp',
-    'btlface0_c0760.webp', 'btlface0_c0760a.webp', 'btlface0_c0760b.webp',
+    'btlface0_c0760.webp', 'btlface0_c0760_c01.webp',
+    'btlface0_c0760a.webp', 'btlface0_c0760a_c01.webp',
+    'btlface0_c0760b.webp', 'btlface0_c0760b_c01.webp',
     'btlface0_c0765.webp', 'btlface0_c0765_c01.webp',
     'btlface0_c0770.webp', 'btlface0_c0770_c01.webp',
+    'btlface0_c0775.webp', 'btlface0_c0775_c01.webp',
     'btlface0_c0780.webp', 'btlface0_c0780_c01.webp',
     'btlface0_c0781.webp', 'btlface0_c0781_c01.webp',
+    'btlface0_c0782.webp', 'btlface0_c0782_c01.webp',
+    'btlface0_c0782_c01_e.webp', 'btlface0_c0782_c02.webp',
+    'btlface0_c0782_e.webp',
     'btlface0_c0783.webp', 'btlface0_c0783_c01.webp',
     'btlface0_c0785.webp', 'btlface0_c0785_c01.webp',
-    'btlface0_c0785_w2.webp', 'btlface0_c0785a_w1.webp',
-    'btlface0_c0785a_w3.webp',
-    'btlface0_c0786.webp', 'btlface0_c0786_w1.webp', 'btlface0_c0786_w2.webp',
+    'btlface0_c0785_e.webp', 'btlface0_c0785_w2.webp',
+    'btlface0_c0785a_w1.webp', 'btlface0_c0785a_w3.webp',
+    'btlface0_c0786.webp', 'btlface0_c0786_e.webp',
+    'btlface0_c0786_w1.webp', 'btlface0_c0786_w2.webp',
     'btlface0_c0786a.webp', 'btlface0_c0786a_w1.webp',
     'btlface0_c0786a_w3.webp',
-    'btlface0_c0787.webp', 'btlface0_c0787_w2.webp',
-    'btlface0_c0787a_w1.webp', 'btlface0_c0787a_w3.webp',
+    'btlface0_c0787.webp', 'btlface0_c0787_e.webp',
+    'btlface0_c0787_w2.webp', 'btlface0_c0787a_w1.webp',
+    'btlface0_c0787a_w3.webp',
     'btlface0_c0790.webp', 'btlface0_c0790_c01.webp',
     'btlface0_c0791.webp', 'btlface0_c0791_c01.webp',
+    'btlface0_c0791_c01_e.webp', 'btlface0_c0791_e.webp',
     'btlface0_c0792.webp', 'btlface0_c0792_c01.webp',
-    'btlface0_c0792_c02.webp',
+    'btlface0_c0792_c01_e.webp', 'btlface0_c0792_c02.webp',
+    'btlface0_c0792_e.webp',
     'btlface0_c0795.webp', 'btlface0_c0795_c01.webp',
-    'btlface0_c0800.webp', 'btlface0_c0801.webp',
+    'btlface0_c0795_c01_e.webp', 'btlface0_c0795_e.webp',
+    'btlface0_c0800.webp', 'btlface0_c0800_e.webp',
+    'btlface0_c0801.webp', 'btlface0_c0801_e.webp',
+    'btlface0_c0802.webp', 'btlface0_c0802_e.webp',
     'btlface0_c0831_c01.webp', 'btlface0_c0832.webp', 'btlface0_c0840.webp',
-    'btlface0_c5001.webp', 'btlface0_c5001_c03.webp', 'btlface0_c5001_c10.webp',
-    'btlface0_c5003.webp', 'btlface0_c5003_1.webp',
-    'btlface0_c5005.webp', 'btlface0_c5005p_cl.webp',
+    'btlface0_c5001.webp', 'btlface0_c5001_c03.webp',
+    'btlface0_c5001_c10.webp', 'btlface0_c5001_c15.webp',
+    'btlface0_c5003.webp', 'btlface0_c5003_1.webp', 'btlface0_c5003_c15.webp',
+    'btlface0_c5005.webp', 'btlface0_c5005_c15.webp',
+    'btlface0_c5005_c15_cl.webp', 'btlface0_c5005p_cl.webp',
     'btlface0_c5007.webp', 'btlface0_c5007_c03.webp',
-    'btlface0_c5007_c03_1.webp',
-    'btlface0_c5110.webp', 'btlface0_c5110_c10.webp',
-    'btlface0_c5112.webp', 'btlface0_c5113.webp', 'btlface0_c5113_c00.webp',
+    'btlface0_c5007_c03_1.webp', 'btlface0_c5007_c15.webp',
+    'btlface0_c5008.webp', 'btlface0_c5009.webp', 'btlface0_c5009_c00.webp',
+    'btlface0_c5110.webp', 'btlface0_c5110_c10.webp', 'btlface0_c5110_c15.webp',
+    'btlface0_c5112.webp', 'btlface0_c5112_c00.webp',
+    'btlface0_c5113.webp', 'btlface0_c5113_c00.webp',
     'btlface0_c5114.webp', 'btlface0_c5114_1.webp', 'btlface0_c5114_c10.webp',
-    'btlface0_c5115.webp', 'btlface0_c5116.webp',
-    'btlface0_c5117.webp', 'btlface0_c5117_c10.webp',
+    'btlface0_c5115.webp', 'btlface0_c5115_c10.webp',
+    'btlface0_c5116.webp',
+    'btlface0_c5117.webp', 'btlface0_c5117_c10.webp', 'btlface0_c5117_c12.webp',
     'btlface0_c5118.webp', 'btlface0_c5119.webp', 'btlface0_c5119_c03.webp',
     'btlface0_c5120.webp', 'btlface0_c5120_c00.webp',
+    'btlface0_c5121.webp', 'btlface0_c5122.webp', 'btlface0_c5123.webp',
     'btlface0_c5300.webp', 'btlface0_c5300_1.webp',
-    'btlface0_c5301.webp', 'btlface0_c5302.webp',
+    'btlface0_c5301.webp', 'btlface0_c5301_c10.webp',
+    'btlface0_c5302.webp',
     'btlface0_c5311.webp', 'btlface0_c5313.webp', 'btlface0_c5314.webp',
-    'btlface0_c5315.webp', 'btlface0_c5319.webp', 'btlface0_c5320.webp',
-    'btlface0_c5322.webp', 'btlface0_c5324.webp', 'btlface0_c5327.webp',
-    'btlface0_c5490.webp',
+    'btlface0_c5315.webp', 'btlface0_c5316.webp',
+    'btlface0_c5319.webp', 'btlface0_c5320.webp',
+    'btlface0_c5322.webp', 'btlface0_c5323.webp', 'btlface0_c5323_c03.webp',
+    'btlface0_c5324.webp',
+    'btlface0_c5325.webp', 'btlface0_c5325_c15.webp',
+    'btlface0_c5327.webp', 'btlface0_c5329.webp',
+    'btlface0_c5404.webp', 'btlface0_c5490.webp',
     'btlface0_c5511b.webp', 'btlface0_c5541_c01.webp',
     'btlface0_c5680.webp', 'btlface0_c5710.webp', 'btlface0_c5711.webp',
-    'btlface0_c5751.webp',
+    'btlface0_c5750.webp', 'btlface0_c5751.webp',
 }
 
 # Any <tag> (angle-bracketed control code). Handles <k>, <#E..>, <#M..>,
@@ -292,8 +333,8 @@ def _decode_dialogue(args):
         like `"<#E[5]#M_0#B_0>"` (dropped after tag-stripping leaves them
         empty);
       - int 11 followed by an int: voice marker + voice_id;
-      - int 10: line separator (ignored; tag-stripping already gives us
-        the right order from the string args);
+      - int 10: line separator (ignored; string order is preserved in the
+        arg list);
       - other ints: rare per-call flags (ignored).
 
     Returns (chrId, [lines], voice_id or None), or None if the call had
@@ -319,7 +360,7 @@ def _decode_dialogue(args):
             if isinstance(nxt, int):
                 voice_id = nxt
                 i += 1  # consume the voice_id slot
-        # Other ints (10 = separator; rare flags like 14, 15 in ani files)
+        # Other ints (10 = separator; rare flags in ani files)
         # are ignored; string order is preserved so we don't need them.
         i += 1
 
@@ -331,7 +372,7 @@ def _decode_dialogue(args):
 def load_tname(path):
     """Parse t_name.json. Returns dict chrId -> {name, full_name_en, model}.
     First entry per chrId wins (outfit-variant rows come later and are
-    skipped, matching Reverie's `first wins` rule)."""
+    skipped)."""
     with open(path, 'r', encoding='utf-8') as f:
         doc = json.load(f)
     out = {}
@@ -369,55 +410,51 @@ def load_tvoice(path):
     return out
 
 
+def _resolve_tier(stem, suffix, inventory, prefix):
+    """Priority ladder within a single tier (avfc or btlface).
+      1. {prefix}{stem}_c15 — horizon canonical variant
+      2. {prefix}{stem}_c10
+      3. {prefix}{stem}    — bare
+      4. {prefix}{suffix}  — exact model match (when suffix differs)
+      5. Any other {prefix}{stem}_c## — lowest sorts first
+    Returns the filename or None."""
+    tried = [
+        f'{prefix}{stem}_c15.webp',
+        f'{prefix}{stem}_c10.webp',
+        f'{prefix}{stem}.webp',
+        f'{prefix}{suffix}.webp',
+    ]
+    for c in tried:
+        if c in inventory:
+            return c
+    variants = sorted(p for p in inventory
+                      if p.startswith(f'{prefix}{stem}_') and p not in tried)
+    if variants:
+        return variants[0]
+    return None
+
+
 def portrait_for(entry):
-    """Resolve portrait filename for a t_name entry following the priority
-    ladder. Returns (filename, tier) where tier in {'face','note','btl'} or
-    (None, None) if no match. `_c10` is db2's canonical variant and beats
-    bare + other variants."""
+    """Resolve portrait filename for a t_name entry.
+    Tier order: avfc → btlface. No noteface tier in horizon.
+    Within each tier, _c15 wins over _c10 wins over bare."""
     if not entry:
         return None, None
     model = entry.get('model') or ''
     if not model.startswith('chr'):
         return None, None
-    suffix = model[len('chr'):]        # e.g. '0306_c02' or '0306'
+    suffix = model[len('chr'):]        # e.g. '0000_c15' or '0000'
     if not suffix:
         return None, None
-    stem = suffix.split('_')[0]        # e.g. '0306'
+    stem = suffix.split('_')[0]        # e.g. '0000'
 
-    # Tier 1: avfc
-    candidates = [
-        f'avfc{suffix}.webp',
-        f'avfc{stem}_c10.webp',
-        f'avfc{stem}.webp',
-    ]
-    for c in candidates:
-        if c in AVAILABLE_PORTRAITS:
-            return c, 'face'
-    # Any remaining variant, lowest suffix wins.
-    variants = sorted(p for p in AVAILABLE_PORTRAITS
-                      if p.startswith(f'avfc{stem}_') and p not in candidates)
-    if variants:
-        return variants[0], 'face'
+    pf = _resolve_tier(stem, suffix, AVAILABLE_PORTRAITS, 'avfc')
+    if pf:
+        return pf, 'face'
 
-    # Tier 2: btlface
-    candidates = [
-        f'btlface0_c{suffix}.webp',
-        f'btlface0_c{stem}_c10.webp',
-        f'btlface0_c{stem}.webp',
-    ]
-    for c in candidates:
-        if c in AVAILABLE_BTLFACE:
-            return c, 'btl'
-    variants = sorted(p for p in AVAILABLE_BTLFACE
-                      if p.startswith(f'btlface0_c{stem}_') and p not in candidates)
-    if variants:
-        return variants[0], 'btl'
-
-    # Tier 3: noteface (no variant suffix). In practice btlface coverage
-    # is broad enough that this tier almost never triggers.
-    n = f'noteface_c{stem}.webp'
-    if n in AVAILABLE_NOTES:
-        return n, 'note'
+    pf = _resolve_tier(stem, suffix, AVAILABLE_BTLFACE, 'btlface0_c')
+    if pf:
+        return pf, 'btl'
 
     return None, None
 
@@ -425,7 +462,7 @@ def portrait_for(entry):
 def pc_icon_html(filename, tier):
     if not filename:
         return ''
-    cls = {'face': 'itp-kuro', 'note': 'itp-noteface', 'btl': 'itp-btlface'}[tier]
+    cls = {'face': 'itp-kuro', 'btl': 'itp-btlface'}[tier]
     return f'<img class="{cls}" src="itp/{GAME_ID}/{filename}"/>'
 
 
@@ -455,8 +492,7 @@ def sql_escape(s):
 
 def collect_files(root):
     """Scan DIALOGUE_SUBDIRS under `root` and return {stem: full_path}.
-    Stems are unique across subdirs (verified at repo level), so a flat
-    dict is safe."""
+    Stems are unique across subdirs, so a flat dict is safe."""
     out = {}
     for sub in DIALOGUE_SUBDIRS:
         d = os.path.join(root, sub)
@@ -482,14 +518,16 @@ def main():
 
     def speaker(chr_id, override, side_tname, side_field):
         if override:
-            return override
+            return override.strip()
         if chr_id in ANONYMOUS_CHR_IDS:
             return ''
         entry = side_tname.get(chr_id)
         if not entry:
             return ''
-        # EN preferred: full_name_en. JP preferred: name.
-        return entry.get(side_field) or entry.get('name') or ''
+        # EN preferred: full_name_en. JP preferred: name. Horizon's t_name
+        # has stray trailing spaces (e.g. "Van ") — strip them.
+        val = entry.get(side_field) or entry.get('name') or ''
+        return val.strip()
 
     def portrait(chr_id):
         if chr_id in ANONYMOUS_CHR_IDS:
