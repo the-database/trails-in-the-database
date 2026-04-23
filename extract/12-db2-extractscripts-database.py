@@ -1,11 +1,12 @@
 """Extract Trails through Daybreak 2 (game 12) dialogue into db2.sql.
 
-Parses KuroTools' ED9 assembly-style Python output for EN + JP scripts.
-Unlike Decompiler2's high-level ChrTalk() AST (used by the Reverie extractor),
-KuroTools emits low-level bytecode: PUSHSTRING/PUSHINTEGER pushes args onto
-a stack, then RUNCMD(N, "Cmd_text_06") consumes the last N pushes as a
-dialogue call. This script walks each function's statement list linearly,
-tracking push state, and decodes dialogues at each RUNCMD site.
+Parses .ing files decompiled from the game's ED9 scripts. Dialogue is
+expressed as `system[5,6](chrId, ..., text, ...)` calls with text lines
+inline; speaker-name overrides use `chr_set_display_name(chrId, "name")`.
+Each top-level `fn name()` is a scene. Line-number labels (`NNN@`) are
+stripped before parsing. Each interesting call is extracted with balanced-
+paren scanning and parsed via `ast.parse` (the calls themselves are valid
+Python once labels are stripped).
 """
 
 import ast
@@ -15,24 +16,17 @@ import re
 import sys
 
 DB2_ROOT = os.path.join(os.path.expanduser('~'), 'Documents', 'programming', 'KuroTools', 'daybreak2_extract')
-EN_ROOT = os.path.join(DB2_ROOT, 'en_py')
-JP_ROOT = os.path.join(DB2_ROOT, 'jp_py')
+EN_ROOT = os.path.join(DB2_ROOT, 'en.ing', 'script_en')
+JP_ROOT = os.path.join(DB2_ROOT, 'jp.ing', 'script')
 EN_TNAME = os.path.join(DB2_ROOT, 'en_json', 't_name.json')
 JP_TNAME = os.path.join(DB2_ROOT, 'jp_json', 't_name.json')
 JP_TVOICE = os.path.join(DB2_ROOT, 'jp_json', 't_voice.json')
 GAME_ID = 12
 OUTPUT = 'db2.sql'
 
-# Boilerplate/helper stems with no field dialogue. `m0000` is the shared
-# `mes_message_close`/`wait_prompt` helper library (not a scene).
-# AI stems (`ai_*`) and monster stems (`mon*`) are enemy-behavior scripts.
-SKIP_STEMS = {
-    'personaltemplate', 'personaltemplate2',
-    'system', 'system2', 'sys_event', 'sys_fdungeon',
-    'debug', 'sound_ani', 'btlmagic', 'common', 'chrx000',
-    'm0000',
-}
-SKIP_PREFIXES = ('ai_', 'mon', 'btl_')
+# Subdirs under the script root that contain real dialogue. `battle`,
+# `obj`, `ai` have zero `system[5,6]` calls and are skipped.
+DIALOGUE_SUBDIRS = ('scena', 'cutscene', 'minigame', 'ani')
 
 # Full face portraits (39 files in image_portraits/*.dds — converted to webp).
 AVAILABLE_PORTRAITS = {
@@ -143,190 +137,187 @@ AVAILABLE_BTLFACE = {
 }
 
 # Any <tag> (angle-bracketed control code). Handles <k>, <#E..>, <#M..>,
-# <#B..> etc. all in one pass.
+# <#B..>, <S5>, <K>, <c888>, <W500> etc. all in one pass.
 ANGLE_TAG_RE = re.compile(r'<[^>]*>')
-# Reverie-style #X[...] fallback (rare in db2 but harmless if absent).
-HASH_CODE_RE = re.compile(r'#[A-Za-z](?:_[A-Za-z0-9]+|\[[A-Za-z0-9]+\])?')
 WHITESPACE_RE = re.compile(r'[ \t]+')
 
-# Pushes we treat as stack-relevant. PUSHCALLER/PUSHRETURN are CALL-frame
-# setup, not data args — skip them so the effective stack is data-only.
-STACK_PUSH_NAMES = {
-    'PUSHSTRING', 'PUSHINTEGER', 'PUSHFLOAT', 'PUSHUNDEFINED', 'PUSHBOOLEAN',
-}
+# `NNN@` line-number labels are sprinkled before statements and inside
+# argument lists. They're not part of the logic — strip before parsing.
+LABEL_RE = re.compile(r'\d+@')
+
+# Top-level scene function. `prelude fn ...` (system opcode alias) starts
+# with 'prelude' so `(?m)^fn` excludes preludes.
+FN_HEADER_RE = re.compile(r'(?m)^fn\s+(\w+)\s*\(')
+
+# Dialogue opcode: system[5,6](chrId, ...args...)
+DIALOGUE_CALL_RE = re.compile(r'\bsystem\s*\[\s*5\s*,\s*6\s*\]\s*\(')
+
+# OP-27 equivalent: chr_set_display_name(chrId, "name")
+DISPLAY_NAME_CALL_RE = re.compile(r'\bchr_set_display_name\s*\(')
+
+
+def _find_balanced(s, open_paren_idx):
+    """Given position of an opening '(' in s, return index AFTER the
+    matching ')'. String literals are respected so parens inside strings
+    don't count. Returns -1 if unmatched."""
+    depth = 0
+    i = open_paren_idx
+    in_str = None
+    escape = False
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif c == '\\':
+                escape = True
+            elif c == in_str:
+                in_str = None
+        else:
+            if c == '"' or c == "'":
+                in_str = c
+            elif c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+        i += 1
+    return -1
 
 
 def _const_value(node):
-    """ast.Constant → its python value, else None."""
+    """ast.Constant → python value; handle unary minus on ints/floats;
+    reject anything else."""
     if isinstance(node, ast.Constant):
         return node.value
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
-        if isinstance(node.operand, ast.Constant):
+        if isinstance(node.operand, ast.Constant) and isinstance(node.operand.value, (int, float)):
             return -node.operand.value
     return None
 
 
-def _call_info(call):
-    """Return (func_name, [positional arg values]) or None if not a Call we
-    can reason about. Values are unwrapped constants; non-constant args
-    become None."""
-    if not isinstance(call, ast.Call):
+def _parse_call_args(call_text):
+    """`call_text` is a single Python call like `system[5,6]("a", 10, "b")`.
+    Return the list of argument AST nodes, or None on parse failure."""
+    try:
+        tree = ast.parse(call_text, mode='eval')
+    except SyntaxError:
         return None
-    if isinstance(call.func, ast.Name):
-        name = call.func.id
-    elif isinstance(call.func, ast.Attribute):
-        name = call.func.attr
-    else:
+    if not isinstance(tree.body, ast.Call):
         return None
-    args = [_const_value(a) for a in call.args]
-    return name, args
+    return tree.body.args
 
 
 def parse_script(path):
-    """Parse one KuroTools-decompiled script file.
+    """Parse one .ing file and return a list of dialogue tuples:
+      (scene_idx, chr_id, lines, voice_id, override)
 
-    Returns list of (scene_idx, chr_id, lines, voice_id, override). Rows
-    follow file order. OP-27 equivalent is CALL(chr_set_display_name)
-    which latches a display name per chrId until overwritten (or scene end).
+    Scenes are top-level `fn` declarations. `chr_set_display_name(chrId,
+    "name")` latches a display name per chrId until overwritten; the
+    latch resets at scene (function) boundaries.
     """
     with open(path, 'r', encoding='utf-8') as f:
         src = f.read()
-    try:
-        tree = ast.parse(src, filename=path)
-    except SyntaxError as e:
-        print(f'WARN: syntax error in {path}: {e}', file=sys.stderr)
-        return []
+    src = LABEL_RE.sub('', src)
 
-    # Find top-level `def script():`. Everything dialogue-related is inside.
-    script_body = None
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == 'script':
-            script_body = node.body
-            break
-    if script_body is None:
-        return []
+    # Collect events (scene boundaries + dialogue calls + name-overrides)
+    # in source order, keyed by their character offset.
+    events = []
+
+    for m in FN_HEADER_RE.finditer(src):
+        events.append((m.start(), 'fn', None))
+
+    for m in DIALOGUE_CALL_RE.finditer(src):
+        open_paren = m.end() - 1
+        end = _find_balanced(src, open_paren)
+        if end == -1:
+            continue
+        events.append((m.start(), 'dialogue', src[m.start():end]))
+
+    for m in DISPLAY_NAME_CALL_RE.finditer(src):
+        open_paren = m.end() - 1
+        end = _find_balanced(src, open_paren)
+        if end == -1:
+            continue
+        events.append((m.start(), 'set_name', src[m.start():end]))
+
+    events.sort(key=lambda e: e[0])
 
     dialogues = []
     scene_idx = -1
-    stack = []         # list of (kind, value) for recent data pushes
-    latched = {}       # chrId -> display-name override (OP-27 equivalent)
+    latched = {}
 
-    for stmt in script_body:
-        # Only care about expression statements wrapping a Call.
-        if not isinstance(stmt, ast.Expr):
-            continue
-        info = _call_info(stmt.value)
-        if info is None:
-            continue
-        fname, args = info
-
-        if fname == 'set_current_function':
+    for _pos, kind, payload in events:
+        if kind == 'fn':
             scene_idx += 1
-            stack = []
             latched = {}
             continue
-
-        if fname in STACK_PUSH_NAMES:
-            val = args[0] if args else None
-            kind = (
-                'str' if isinstance(val, str)
-                else 'int' if isinstance(val, int) and not isinstance(val, bool)
-                else 'float' if isinstance(val, float)
-                else 'other'
-            )
-            stack.append((kind, val))
+        if scene_idx < 0:
+            continue
+        args = _parse_call_args(payload)
+        if args is None:
             continue
 
-        if fname in ('Label', 'POP'):
-            stack = []
+        if kind == 'set_name':
+            if len(args) >= 2:
+                cid = _const_value(args[0])
+                nm = _const_value(args[1])
+                if isinstance(cid, int) and isinstance(nm, str) and nm:
+                    latched[cid] = nm
             continue
 
-        if fname == 'RUNCMD':
-            # RUNCMD(n_args, "Cmd_name")
-            if len(args) >= 2 and isinstance(args[0], int) and args[1] == 'Cmd_text_06':
-                n = args[0]
-                if scene_idx >= 0 and n >= 3 and len(stack) >= n:
-                    frame = stack[-n:]
-                    decoded = _decode_dialogue(frame)
-                    if decoded:
-                        chr_id, lines, voice_id = decoded
-                        override = latched.get(chr_id, '')
-                        dialogues.append(
-                            (scene_idx, chr_id, lines, voice_id, override)
-                        )
-            stack = []
-            continue
-
-        if fname == 'CALL':
-            target = args[0] if args else None
-            if target == 'chr_set_display_name' and len(stack) >= 2:
-                # Args pushed just before CALL: ..., PUSHSTRING(name), PUSHINTEGER(chrId)
-                top = stack[-1]
-                prev = stack[-2]
-                if top[0] == 'int' and prev[0] == 'str':
-                    latched[top[1]] = prev[1]
-            stack = []
-            continue
-
-        if fname == 'CALLFROMANOTHERSCRIPT':
-            stack = []
-            continue
-
-        # Any other instruction: assume it doesn't touch the stack for our
-        # purposes. (SAVERESULT, EXIT, JUMP*, etc.) We could be paranoid and
-        # reset, but that would lose Cmd_text_06 arg setup in rare cases.
+        if kind == 'dialogue':
+            decoded = _decode_dialogue(args)
+            if decoded:
+                chr_id, lines, voice_id = decoded
+                override = latched.get(chr_id, '')
+                dialogues.append((scene_idx, chr_id, lines, voice_id, override))
 
     return dialogues
 
 
-def _decode_dialogue(frame):
-    """Decode last-N pushes into (chrId, [lines], voice_id or None).
-    frame[-1] = top of stack = chrId.
-    frame[-2] = control string (emote/mouth/body tag).
-    If frame[-2] is int(11): voice present, frame[-3]=voice_id, rest are
-      alternating text + int(10) separators.
-    Otherwise: no voice, remaining frame is alternating text + int(10).
-    Returns None if structure doesn't parse (malformed stack).
+def _decode_dialogue(args):
+    """Decode the arg list of a `system[5,6](...)` call.
+
+    Layout: first arg is chrId. Remaining args are a mix of:
+      - strings: text lines (in reading order) and/or pure-control tags
+        like `"<#E[5]#M_0#B_0>"` (dropped after tag-stripping leaves them
+        empty);
+      - int 11 followed by an int: voice marker + voice_id;
+      - int 10: line separator (ignored; tag-stripping already gives us
+        the right order from the string args);
+      - other ints: rare per-call flags (ignored).
+
+    Returns (chrId, [lines], voice_id or None), or None if the call had
+    no usable text.
     """
-    if len(frame) < 3:
+    if not args:
         return None
-    top = frame[-1]
-    ctl = frame[-2]
-    if top[0] != 'int':
+    chr_id = _const_value(args[0])
+    if not isinstance(chr_id, int):
         return None
-    chr_id = top[1]
 
-    voice_id = None
-    # Walk downward from -2. control string is expected; some rare dialogues
-    # may have an integer there instead — tolerate either.
-    idx = len(frame) - 2
-    # Skip control string slot if it's a string.
-    if idx >= 0 and frame[idx][0] == 'str':
-        idx -= 1
-    # Voice marker: int 11 → voice present. Below it: voice_id int.
-    if idx >= 0 and frame[idx] == ('int', 11):
-        idx -= 1
-        if idx >= 0 and frame[idx][0] == 'int':
-            voice_id = frame[idx][1]
-            idx -= 1
-
-    # Remaining frame[0..idx] should be strings separated by int(10).
     lines = []
-    # Walk from idx down to 0, collecting strings and skipping int(10).
-    j = idx
-    while j >= 0:
-        item = frame[j]
-        if item[0] == 'str':
-            lines.append(item[1])
-        elif item == ('int', 10):
-            pass  # separator
-        else:
-            # Unexpected value — skip; don't crash.
-            pass
-        j -= 1
+    voice_id = None
+    i = 1
+    while i < len(args):
+        v = _const_value(args[i])
+        if isinstance(v, str):
+            cleaned = ANGLE_TAG_RE.sub('', v).strip()
+            if cleaned:
+                lines.append(cleaned)
+        elif isinstance(v, int) and v == 11 and i + 1 < len(args):
+            nxt = _const_value(args[i + 1])
+            if isinstance(nxt, int):
+                voice_id = nxt
+                i += 1  # consume the voice_id slot
+        # Other ints (10 = separator; rare flags like 14, 15 in ani files)
+        # are ignored; string order is preserved so we don't need them.
+        i += 1
 
     if not lines:
-        # No actual text — skip (likely some non-dialogue use of Cmd_text_06).
         return None
     return chr_id, lines, voice_id
 
@@ -402,12 +393,7 @@ def portrait_for(entry):
     if variants:
         return variants[0], 'face'
 
-    # Tier 2: noteface (no variant suffix)
-    n = f'noteface_c{stem}.webp'
-    if n in AVAILABLE_NOTES:
-        return n, 'note'
-
-    # Tier 3: btlface
+    # Tier 2: btlface
     candidates = [
         f'btlface0_c{suffix}.webp',
         f'btlface0_c{stem}_c10.webp',
@@ -420,6 +406,12 @@ def portrait_for(entry):
                       if p.startswith(f'btlface0_c{stem}_') and p not in candidates)
     if variants:
         return variants[0], 'btl'
+
+    # Tier 3: noteface (no variant suffix). In practice btlface coverage
+    # is broad enough that this tier almost never triggers.
+    n = f'noteface_c{stem}.webp'
+    if n in AVAILABLE_NOTES:
+        return n, 'note'
 
     return None, None
 
@@ -443,11 +435,9 @@ def voice_wrap(html_text, voice_file):
 
 
 def clean_text(lines, joiner):
-    """Join dialogue lines. Strip <...> control tags and leftover #-codes."""
-    text = ('\n'.join(lines)).strip()
-    text = ANGLE_TAG_RE.sub('', text)
-    text = HASH_CODE_RE.sub('', text)
-    text = text.replace('\n', joiner)
+    """Join dialogue lines. `_decode_dialogue` already strips <...> tags;
+    this just joins + collapses whitespace for the search column."""
+    text = joiner.join(line.strip() for line in lines if line.strip())
     if joiner == ' ':
         text = WHITESPACE_RE.sub(' ', text)
     return text.strip()
@@ -458,18 +448,19 @@ def sql_escape(s):
 
 
 def collect_files(root):
+    """Scan DIALOGUE_SUBDIRS under `root` and return {stem: full_path}.
+    Stems are unique across subdirs (verified at repo level), so a flat
+    dict is safe."""
     out = {}
-    if not os.path.isdir(root):
-        return out
-    for entry in os.listdir(root):
-        if not entry.endswith('.py'):
+    for sub in DIALOGUE_SUBDIRS:
+        d = os.path.join(root, sub)
+        if not os.path.isdir(d):
             continue
-        stem = entry[:-3]
-        if stem in SKIP_STEMS:
-            continue
-        if any(stem.startswith(p) for p in SKIP_PREFIXES):
-            continue
-        out[stem] = os.path.join(root, entry)
+        for entry in os.listdir(d):
+            if not entry.endswith('.ing'):
+                continue
+            stem = entry[:-4]
+            out.setdefault(stem, os.path.join(d, entry))
     return out
 
 
