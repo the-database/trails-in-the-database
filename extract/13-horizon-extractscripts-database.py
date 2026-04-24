@@ -505,6 +505,57 @@ def collect_files(root):
     return out
 
 
+def _lcs_pairs(a, b):
+    """LCS alignment on (scene_idx, chr_id) signatures."""
+    n, m = len(a), len(b)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n):
+        ai = (a[i][0], a[i][1])
+        for j in range(m):
+            if ai == (b[j][0], b[j][1]):
+                dp[i + 1][j + 1] = dp[i][j] + 1
+            else:
+                dp[i + 1][j + 1] = max(dp[i + 1][j], dp[i][j + 1])
+    out = []
+    i, j = n, m
+    while i > 0 and j > 0:
+        if (a[i - 1][0], a[i - 1][1]) == (b[j - 1][0], b[j - 1][1]):
+            out.append((a[i - 1], b[j - 1]))
+            i -= 1
+            j -= 1
+        elif dp[i - 1][j] >= dp[i][j - 1]:
+            out.append((a[i - 1], None))
+            i -= 1
+        else:
+            out.append((None, b[j - 1]))
+            j -= 1
+    while i > 0:
+        out.append((a[i - 1], None))
+        i -= 1
+    while j > 0:
+        out.append((None, b[j - 1]))
+        j -= 1
+    out.reverse()
+    return out
+
+
+def align_scenes(en_d, jp_d):
+    """Align dialogues scene-by-scene via LCS on (scene_idx, chr_id). Scene
+    (fn) counts match across EN/JP, so grouping by scene_idx is a safe
+    reset boundary. Handles mid-file signature drift without cross-pairing
+    unrelated characters."""
+    en_by = {}
+    jp_by = {}
+    for d in en_d:
+        en_by.setdefault(d[0], []).append(d)
+    for d in jp_d:
+        jp_by.setdefault(d[0], []).append(d)
+    aligned = []
+    for scene in sorted(set(en_by) | set(jp_by)):
+        aligned.extend(_lcs_pairs(en_by.get(scene, []), jp_by.get(scene, [])))
+    return aligned
+
+
 def main():
     en_files = collect_files(EN_ROOT)
     jp_files = collect_files(JP_ROOT)
@@ -537,15 +588,15 @@ def main():
     for stem in stems:
         en_d = parse_script(en_files[stem]) if stem in en_files else []
         jp_d = parse_script(jp_files[stem]) if stem in jp_files else []
-        if en_d and jp_d and len(en_d) != len(jp_d):
-            print(f'WARN {stem}: EN={len(en_d)} JP={len(jp_d)}', file=sys.stderr)
-        n = max(len(en_d), len(jp_d))
-        if n == 0:
+        pairs = align_scenes(en_d, jp_d)
+        if not pairs:
             continue
+        unpaired = sum(1 for e, j in pairs if e is None or j is None)
+        if unpaired:
+            print(f'WARN {stem}: {unpaired} unpaired rows '
+                  f'(EN={len(en_d)} JP={len(jp_d)})', file=sys.stderr)
         rownum = 1
-        for i in range(n):
-            en_t = en_d[i] if i < len(en_d) else None
-            jp_t = jp_d[i] if i < len(jp_d) else None
+        for en_t, jp_t in pairs:
             en_scene, en_chr, en_lines, en_voice, en_override = (
                 en_t if en_t else (0, None, [], None, '')
             )

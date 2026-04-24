@@ -62,11 +62,13 @@ def _scpstr_placeholder(node):
     """Convert any `scpstr(...)` call inside a dialogue tuple to a string
     so the dialogue isn't dropped. Forms seen:
       scpstr(SCPSTR_CODE_ITEM, N)   -> '[item:N]'
-      scpstr(SCPSTR_CODE_COLOR, N)  -> ''      (color codes have no text)
-      scpstr(SCPSTR_CODE_X)         -> ''      (formatting/control)
-      scpstr(0xD)                   -> ''      (raw numeric format code)
-    Item/color tables are only available as binary in this dataset; the
-    item-N form preserves the index for downstream lookup."""
+      scpstr(SCPSTR_CODE_COLOR, N)  -> ' '     (color/formatting toggle)
+      scpstr(SCPSTR_CODE_X)         -> ' '     (control codes like LINE_FEED,
+                                                ENTER, etc.)
+      scpstr(0xD)                   -> ' '     (raw CR / line break)
+    A space is emitted instead of '' so that text on either side of the
+    scpstr doesn't get word-joined (e.g. 'that Get' + scpstr(0xD) + 'Out of
+    Jail Free' becoming 'GetOut of Jail Free')."""
     if not isinstance(node, ast.Call):
         return None
     fname = None
@@ -77,14 +79,14 @@ def _scpstr_placeholder(node):
     if fname != 'scpstr':
         return None
     if not node.args:
-        return ''
+        return ' '
     tag = node.args[0]
     tag_name = tag.id if isinstance(tag, ast.Name) else None
     if tag_name == 'SCPSTR_CODE_ITEM' and len(node.args) >= 2:
         idx = _const_value(node.args[1])
         if isinstance(idx, int):
             return f'[item:{idx}]'
-    return ''
+    return ' '
 
 
 def _string_lines(node):
@@ -275,6 +277,16 @@ def resolve_speaker(char_id, op_name, npc_inline, latched, talk_actor,
             return ''
         return sl[nsi].strip()
 
+    # Falcom engine convention: char_ids 0x00-0x07 are the 8 active-party
+    # slots (Lloyd/Elie/Tio/Randy/... whoever is in slot N at runtime). We
+    # can't resolve these without simulating party state; return empty.
+    # char_ids 0x08-0xFD are local NPCs indexed from DeclNpc[char_id-8],
+    # mapping to BuildStringList via the position+1 rule.
+    PARTY_SLOT_COUNT = 8
+
+    def _from_local_npc(cid):
+        return _from_npc_idx(cid - PARTY_SLOT_COUNT)
+
     if char_id >= PARTY_OFFSET:
         return _from_tname(char_id)
 
@@ -282,14 +294,19 @@ def resolve_speaker(char_id, op_name, npc_inline, latched, talk_actor,
         eff = talk_actor if talk_actor not in (None, 0xFE) else 0xFE
         if eff != 0xFE and eff >= PARTY_OFFSET:
             return _from_tname(eff)
-        if eff != 0xFE and 0 <= eff < 0xFE:
-            return _from_npc_idx(eff)
+        if eff != 0xFE and PARTY_SLOT_COUNT <= eff < 0xFE:
+            return _from_local_npc(eff)
+        if eff != 0xFE and 0 <= eff < PARTY_SLOT_COUNT:
+            return ''  # party slot — unknown without party state
         for i, (_, ts, tf) in enumerate(npcs):
             if ts == scena_num and tf == fn_idx:
                 return _from_npc_idx(i)
         return ''
 
-    return _from_npc_idx(char_id)
+    if 0 <= char_id < PARTY_SLOT_COUNT:
+        return ''
+
+    return _from_local_npc(char_id)
 
 
 VOICE_CODE_LEN = 10
@@ -445,6 +462,59 @@ def collect_files(root):
     return out
 
 
+def _lcs_pairs(a, b):
+    """Longest common subsequence pairing on (op_name, char_id) signatures.
+    Returns a list of (a_item_or_None, b_item_or_None) where matched items
+    come as a pair and insertions/deletions come as one-sided entries."""
+    n, m = len(a), len(b)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n):
+        ai = (a[i][1], a[i][2])
+        for j in range(m):
+            if ai == (b[j][1], b[j][2]):
+                dp[i + 1][j + 1] = dp[i][j] + 1
+            else:
+                dp[i + 1][j + 1] = max(dp[i + 1][j], dp[i][j + 1])
+    out = []
+    i, j = n, m
+    while i > 0 and j > 0:
+        if (a[i - 1][1], a[i - 1][2]) == (b[j - 1][1], b[j - 1][2]):
+            out.append((a[i - 1], b[j - 1]))
+            i -= 1
+            j -= 1
+        elif dp[i - 1][j] >= dp[i][j - 1]:
+            out.append((a[i - 1], None))
+            i -= 1
+        else:
+            out.append((None, b[j - 1]))
+            j -= 1
+    while i > 0:
+        out.append((a[i - 1], None))
+        i -= 1
+    while j > 0:
+        out.append((None, b[j - 1]))
+        j -= 1
+    out.reverse()
+    return out
+
+
+def align_scenes(en_d, jp_d):
+    """Align EN and JP dialogues scene-by-scene via LCS on (op_name, char_id).
+    Function (scene) counts match across EN/JP in both Zero and Azure, so
+    grouping by scene_idx gives safe reset boundaries. Within a scene, LCS
+    tolerates translator-added/removed lines (Azure has ~72 such files)."""
+    en_by = {}
+    jp_by = {}
+    for d in en_d:
+        en_by.setdefault(d[0], []).append(d)
+    for d in jp_d:
+        jp_by.setdefault(d[0], []).append(d)
+    aligned = []
+    for scene in sorted(set(en_by) | set(jp_by)):
+        aligned.extend(_lcs_pairs(en_by.get(scene, []), jp_by.get(scene, [])))
+    return aligned
+
+
 def main():
     en_files = collect_files(EN_SCENA_ROOT)
     jp_files = collect_files(JP_SCENA_ROOT)
@@ -461,15 +531,15 @@ def main():
         scena_num = scena_num_for(stem)
         en_ctx, en_d = parse_scena(en_files[stem]) if stem in en_files else (empty_ctx, [])
         jp_ctx, jp_d = parse_scena(jp_files[stem]) if stem in jp_files else (empty_ctx, [])
-        if en_d and jp_d and len(en_d) != len(jp_d):
-            print(f'WARN {stem}: EN={len(en_d)} JP={len(jp_d)}', file=sys.stderr)
-        n = max(len(en_d), len(jp_d))
-        if n == 0:
+        pairs = align_scenes(en_d, jp_d)
+        if not pairs:
             continue
+        unpaired = sum(1 for e, j in pairs if e is None or j is None)
+        if unpaired:
+            print(f'WARN {stem}: {unpaired} unpaired rows '
+                  f'(EN={len(en_d)} JP={len(jp_d)})', file=sys.stderr)
         rownum = 1
-        for i in range(n):
-            jp_t = jp_d[i] if i < len(jp_d) else None
-            en_t = en_d[i] if i < len(en_d) else None
+        for en_t, jp_t in pairs:
             canon = jp_t or en_t
             scene_idx, op_name, char_id, _, _, _, _ = canon
 

@@ -1,16 +1,18 @@
-"""Extract Trails through Daybreak (game 11) dialogue into daybreak.sql.
+"""Extract Trails in the Sky 1st Chapter remake (game 101) into sky1r.sql.
 
-Parses .ing files decompiled by Ingert. Dialogue is expressed as
-`system[5,6](chrId, ..., text, ...)` calls with text lines inline;
-speaker-name overrides use `chr_set_display_name(chrId, "name")`. Each
-top-level `fn name()` is a scene. Line-number labels (`NNN@`) are
-stripped before parsing.
+Same Ingert .ing format as games 11-13 (Kuro engine): dialogue expressed
+as `system[5,6](chrId, ..., text, ...)` calls, speaker overrides via
+`chr_set_display_name(chrId, "name")`. See 13-horizon for the detailed
+format notes.
 
-Differences from db2/horizon:
-  - EN/JP script roots: `daybreak.ing/script_en`, `daybreak.ing/script`
-  - Portrait inventory: 22 avfc + 105 btlface; no noteface, no _c15/_c10
-    variants exist in the game
-  - Portrait priority: exact model match → bare → any other variant
+Game 101 is the 2025 Sky 1st Chapter remake — distinct from the PSP
+original (game 1, binary format, handled by 1-skyfc-extractscripts...).
+
+Differences from horizon:
+  - EN/JP script roots: `sky1st/script_en`, `sky1st/script`
+    (note: `script_en`, not `script_eng`)
+  - DIALOGUE_SUBDIRS drops `cutscene` (0 files)
+  - Portrait inventory: 13 base avfc files, no tier variants, no btlface
 """
 
 import ast
@@ -19,116 +21,60 @@ import os
 import re
 import sys
 
-DAYBREAK_SCRIPT_ROOT = os.path.join(os.path.expanduser('~'), 'Documents', 'programming', 'Ingert', 'data', 'daybreak.ing')
-DAYBREAK_TBL_ROOT = os.path.join(os.path.expanduser('~'), 'Documents', 'programming', 'KuroTools', 'daybreak1_extract')
-EN_ROOT = os.path.join(DAYBREAK_SCRIPT_ROOT, 'script_en')
-JP_ROOT = os.path.join(DAYBREAK_SCRIPT_ROOT, 'script')
-EN_TNAME = os.path.join(DAYBREAK_TBL_ROOT, 'en_json', 't_name.json')
-JP_TNAME = os.path.join(DAYBREAK_TBL_ROOT, 'jp_json', 't_name.json')
-JP_TVOICE = os.path.join(DAYBREAK_TBL_ROOT, 'jp_json', 't_voice.json')
-GAME_ID = 11
-OUTPUT = 'daybreak.sql'
+SKY1R_SCRIPT_ROOT = os.path.join(os.path.expanduser('~'), 'Documents', 'programming', 'Ingert', 'data', 'sky1st')
+SKY1R_TBL_ROOT = os.path.join(os.path.expanduser('~'), 'Documents', 'programming', 'KuroTools', 'sky1_extract')
+EN_ROOT = os.path.join(SKY1R_SCRIPT_ROOT, 'script_en')
+JP_ROOT = os.path.join(SKY1R_SCRIPT_ROOT, 'script')
+EN_TNAME = os.path.join(SKY1R_TBL_ROOT, 'en_json', 't_name.json')
+JP_TNAME = os.path.join(SKY1R_TBL_ROOT, 'jp_json', 't_name.json')
+JP_TVOICE = os.path.join(SKY1R_TBL_ROOT, 'jp_json', 't_voice.json')
+GAME_ID = 101
+OUTPUT = 'sky1r.sql'
 
-# 0xFFFE / 0xFFFF are engine sentinels for anonymous narration. Daybreak's
-# t_name has hundreds of stray entries under character_id=65535 (all outfit
-# variants catalog). Skip name + portrait lookup for these; latched
-# overrides still apply.
+# 0xFFFE / 0xFFFF are engine sentinels for anonymous narration.
 ANONYMOUS_CHR_IDS = frozenset({0xFFFE, 0xFFFF})
 
-# Subdirs under each script root that contain real dialogue. `battle`,
-# `obj`, `ai` have zero `system[5,6]` calls and are skipped.
-DIALOGUE_SUBDIRS = ('scena', 'cutscene', 'minigame', 'ani')
+# Subdirs under each script root that contain dialogue. Sky 1st has no
+# cutscene files; battle/obj/ai/demo have zero `system[5,6]` calls.
+DIALOGUE_SUBDIRS = ('scena', 'minigame', 'ani')
 
-# Full face portraits (22 files in itp x4/*.webp — already webp).
+# Full face portraits — 13 base avfc files in icon/*.dds, converted to
+# webp. No `_c10`/`_c15`/`_c03` variants in the Sky 1st remake inventory.
 AVAILABLE_PORTRAITS = {
-    'avfc0000.webp', 'avfc0002.webp', 'avfc0004.webp', 'avfc0006.webp',
-    'avfc0111.webp', 'avfc0112.webp', 'avfc0113.webp',
-    'avfc0301.webp', 'avfc0304.webp',
-    'avfc5001.webp', 'avfc5001_c03.webp',
-    'avfc5003.webp', 'avfc5005.webp',
-    'avfc5007.webp', 'avfc5007_c03.webp',
-    'avfc5008.webp',
-    'avfc5110.webp', 'avfc5112.webp',
-    'avfc5113.webp', 'avfc5113_c00.webp',
-    'avfc5117.webp', 'avfc5118.webp',
+    'avfc0001.webp', 'avfc0003.webp', 'avfc0005.webp', 'avfc0007.webp',
+    'avfc0117.webp', 'avfc0307.webp', 'avfc0316.webp',
+    'avfc5000.webp', 'avfc5002.webp', 'avfc5004.webp', 'avfc5006.webp',
+    'avfc5308.webp', 'avfc5311.webp',
 }
 
-# Battle faces (105 files) — fallback when no avfc matches.
-AVAILABLE_BTLFACE = {
-    'btlface0_c0000.webp', 'btlface0_c0002.webp', 'btlface0_c0002_1.webp',
-    'btlface0_c0004.webp', 'btlface0_c0006.webp',
-    'btlface0_c0009.webp', 'btlface0_c0009_c00.webp',
-    'btlface0_c0111.webp', 'btlface0_c0112.webp', 'btlface0_c0113.webp',
-    'btlface0_c0114.webp',
-    'btlface0_c0115.webp', 'btlface0_c0115_c00.webp', 'btlface0_c0115_c02.webp',
-    'btlface0_c0116.webp', 'btlface0_c0116_c02.webp',
-    'btlface0_c0117.webp',
-    'btlface0_c0299.webp',
-    'btlface0_c0301.webp', 'btlface0_c0302.webp', 'btlface0_c0302_1.webp',
-    'btlface0_c0304.webp', 'btlface0_c0316.webp', 'btlface0_c0318.webp',
-    'btlface0_c0328.webp', 'btlface0_c0329.webp',
-    'btlface0_c0500.webp', 'btlface0_c0501.webp', 'btlface0_c0503.webp',
-    'btlface0_c0510a.webp', 'btlface0_c0660_c01a.webp',
-    'btlface0_c0712.webp',
-    'btlface0_c0725.webp', 'btlface0_c0725_c01.webp',
-    'btlface0_c0725_c02.webp', 'btlface0_c0725_c03.webp',
-    'btlface0_c0726.webp', 'btlface0_c0726_c01.webp',
-    'btlface0_c0726_c01_p1.webp', 'btlface0_c0726_p1.webp',
-    'btlface0_c0727.webp', 'btlface0_c0727_c01.webp',
-    'btlface0_c0750.webp',
-    'btlface0_c0765.webp', 'btlface0_c0765_c01.webp',
-    'btlface0_c0770.webp', 'btlface0_c0770_c01.webp',
-    'btlface0_c0785.webp', 'btlface0_c0785_c03.webp',
-    'btlface0_c0785_p1.webp', 'btlface0_c0785_w2.webp',
-    'btlface0_c0785a_c03.webp', 'btlface0_c0785a_p1.webp',
-    'btlface0_c0785a_w1.webp', 'btlface0_c0785a_w3.webp',
-    'btlface0_c0786.webp', 'btlface0_c0786_c03.webp',
-    'btlface0_c0786_p1.webp', 'btlface0_c0786_w2.webp',
-    'btlface0_c0786a_c03.webp', 'btlface0_c0786a_p1.webp',
-    'btlface0_c0786a_w1.webp', 'btlface0_c0786a_w3.webp',
-    'btlface0_c0787.webp', 'btlface0_c0787_c03.webp',
-    'btlface0_c0787_p1.webp', 'btlface0_c0787_w2.webp',
-    'btlface0_c0787a_p1.webp', 'btlface0_c0787a_w1.webp',
-    'btlface0_c0787a_w3.webp',
-    'btlface0_c0790.webp', 'btlface0_c0790_c01.webp',
-    'btlface0_c0791.webp', 'btlface0_c0791_c01.webp',
-    'btlface0_c0795.webp', 'btlface0_c0795_c01.webp',
-    'btlface0_c0800.webp', 'btlface0_c0831_c01.webp',
-    'btlface0_c0832.webp',
-    'btlface0_c5001.webp', 'btlface0_c5001_c03.webp',
-    'btlface0_c5003.webp', 'btlface0_c5005.webp',
-    'btlface0_c5007.webp', 'btlface0_c5007_c03.webp',
-    'btlface0_c5007_c03_1.webp',
-    'btlface0_c5110.webp', 'btlface0_c5112.webp',
-    'btlface0_c5113.webp', 'btlface0_c5113_c00.webp',
-    'btlface0_c5115.webp', 'btlface0_c5116.webp',
-    'btlface0_c5117.webp', 'btlface0_c5118.webp',
-    'btlface0_c5300.webp', 'btlface0_c5300_1.webp',
-    'btlface0_c5301.webp',
-    'btlface0_c5311.webp', 'btlface0_c5313.webp', 'btlface0_c5319.webp',
-    'btlface0_c5511b.webp', 'btlface0_c5541_c01.webp',
-    'btlface0_c5680.webp', 'btlface0_c5710.webp', 'btlface0_c5711.webp',
-}
+# No battle faces exist for Sky 1st remake (no btlface assets in the
+# decompile). Kept as an empty set so portrait_for() cleanly falls through.
+AVAILABLE_BTLFACE = set()
 
+# Any <tag> (angle-bracketed control code). Handles <k>, <#E..>, <#M..>,
+# <#B..>, <S5>, <K>, <c888>, <W500> etc. all in one pass.
 ANGLE_TAG_RE = re.compile(r'<[^>]*>')
 WHITESPACE_RE = re.compile(r'[ \t]+')
+
+# `NNN@` line-number labels are sprinkled before statements and inside
+# argument lists. They're not part of the logic — strip before parsing.
 LABEL_RE = re.compile(r'\d+@')
+
+# Top-level scene function. `prelude fn ...` (system opcode alias) starts
+# with 'prelude' so `(?m)^fn` excludes preludes.
 FN_HEADER_RE = re.compile(r'(?m)^fn\s+(\w+)\s*\(')
+
+# Dialogue opcode: system[5,6](chrId, ...args...)
 DIALOGUE_CALL_RE = re.compile(r'\bsystem\s*\[\s*5\s*,\s*6\s*\]\s*\(')
+
+# OP-27 equivalent: chr_set_display_name(chrId, "name")
 DISPLAY_NAME_CALL_RE = re.compile(r'\bchr_set_display_name\s*\(')
 
-# EN decompile-only artifact: `if sound_get_voice_language() == 0 { A }
-# else { B }` branches the unvoiced-fallback path (A) against the voiced
-# path (B). Both branches often contain the same dialogue text, which
-# counts as 2 dialogues to my extractor and double-counts versus the JP
-# side (which has no such branching). Suppress the `== 0` branch so only
-# the voiced path (else) contributes a row.
-VOICE_LANG_IF_RE = re.compile(r'\bif\s+sound_get_voice_language\s*\(\s*\)\s*==\s*0\s*\{')
 
-
-def _find_balanced(s, open_paren_idx, open_char='(', close_char=')'):
-    """Given position of `open_char` in s, return index AFTER the matching
-    `close_char`. String literals are respected. -1 if unmatched."""
+def _find_balanced(s, open_paren_idx):
+    """Given position of an opening '(' in s, return index AFTER the
+    matching ')'. String literals are respected so parens inside strings
+    don't count. Returns -1 if unmatched."""
     depth = 0
     i = open_paren_idx
     in_str = None
@@ -146,9 +92,9 @@ def _find_balanced(s, open_paren_idx, open_char='(', close_char=')'):
         else:
             if c == '"' or c == "'":
                 in_str = c
-            elif c == open_char:
+            elif c == '(':
                 depth += 1
-            elif c == close_char:
+            elif c == ')':
                 depth -= 1
                 if depth == 0:
                     return i + 1
@@ -156,20 +102,9 @@ def _find_balanced(s, open_paren_idx, open_char='(', close_char=')'):
     return -1
 
 
-def _voice_lang_suppress_ranges(src):
-    """Spans to skip during event collection. Covers the body of every
-    `if sound_get_voice_language() == 0 { ... }` block (the unvoiced
-    fallback branch — see VOICE_LANG_IF_RE comment)."""
-    ranges = []
-    for m in VOICE_LANG_IF_RE.finditer(src):
-        brace_open = m.end() - 1
-        brace_close = _find_balanced(src, brace_open, '{', '}')
-        if brace_close != -1:
-            ranges.append((m.start(), brace_close))
-    return ranges
-
-
 def _const_value(node):
+    """ast.Constant → python value; handle unary minus on ints/floats;
+    reject anything else."""
     if isinstance(node, ast.Constant):
         return node.value
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
@@ -179,6 +114,8 @@ def _const_value(node):
 
 
 def _parse_call_args(call_text):
+    """`call_text` is a single Python call like `system[5,6]("a", 10, "b")`.
+    Return the list of argument AST nodes, or None on parse failure."""
     try:
         tree = ast.parse(call_text, mode='eval')
     except SyntaxError:
@@ -189,34 +126,38 @@ def _parse_call_args(call_text):
 
 
 def parse_script(path):
-    """Parse one .ing file. Same logic as horizon's extractor."""
+    """Parse one .ing file and return a list of dialogue tuples:
+      (scene_idx, chr_id, lines, voice_id, override)
+
+    Scenes are top-level `fn` declarations. `chr_set_display_name(chrId,
+    "name")` latches a display name per chrId until overwritten; the
+    latch resets at scene (function) boundaries.
+    """
     with open(path, 'r', encoding='utf-8') as f:
         src = f.read()
     src = LABEL_RE.sub('', src)
 
-    suppress = _voice_lang_suppress_ranges(src)
-
-    def _in_suppress(pos):
-        for s_, e_ in suppress:
-            if s_ <= pos < e_:
-                return True
-        return False
-
+    # Collect events (scene boundaries + dialogue calls + name-overrides)
+    # in source order, keyed by their character offset.
     events = []
+
     for m in FN_HEADER_RE.finditer(src):
         events.append((m.start(), 'fn', None))
+
     for m in DIALOGUE_CALL_RE.finditer(src):
-        if _in_suppress(m.start()):
+        open_paren = m.end() - 1
+        end = _find_balanced(src, open_paren)
+        if end == -1:
             continue
-        end = _find_balanced(src, m.end() - 1)
-        if end != -1:
-            events.append((m.start(), 'dialogue', src[m.start():end]))
+        events.append((m.start(), 'dialogue', src[m.start():end]))
+
     for m in DISPLAY_NAME_CALL_RE.finditer(src):
-        if _in_suppress(m.start()):
+        open_paren = m.end() - 1
+        end = _find_balanced(src, open_paren)
+        if end == -1:
             continue
-        end = _find_balanced(src, m.end() - 1)
-        if end != -1:
-            events.append((m.start(), 'set_name', src[m.start():end]))
+        events.append((m.start(), 'set_name', src[m.start():end]))
+
     events.sort(key=lambda e: e[0])
 
     dialogues = []
@@ -253,9 +194,20 @@ def parse_script(path):
 
 
 def _decode_dialogue(args):
-    """Decode system[5,6](...) args. First arg is chrId; remaining mix of
-    text strings, pure control strings, `11, voice_id` voice pair, and
-    integer separators."""
+    """Decode the arg list of a `system[5,6](...)` call.
+
+    Layout: first arg is chrId. Remaining args are a mix of:
+      - strings: text lines (in reading order) and/or pure-control tags
+        like `"<#E[5]#M_0#B_0>"` (dropped after tag-stripping leaves them
+        empty);
+      - int 11 followed by an int: voice marker + voice_id;
+      - int 10: line separator (ignored; string order is preserved in the
+        arg list);
+      - other ints: rare per-call flags (ignored).
+
+    Returns (chrId, [lines], voice_id or None), or None if the call had
+    no usable text.
+    """
     if not args:
         return None
     chr_id = _const_value(args[0])
@@ -275,7 +227,9 @@ def _decode_dialogue(args):
             nxt = _const_value(args[i + 1])
             if isinstance(nxt, int):
                 voice_id = nxt
-                i += 1
+                i += 1  # consume the voice_id slot
+        # Other ints (10 = separator; rare flags in ani files)
+        # are ignored; string order is preserved so we don't need them.
         i += 1
 
     if not lines:
@@ -284,6 +238,9 @@ def _decode_dialogue(args):
 
 
 def load_tname(path):
+    """Parse t_name.json. Returns dict chrId -> {name, full_name_en, model}.
+    First entry per chrId wins (outfit-variant rows come later and are
+    skipped)."""
     with open(path, 'r', encoding='utf-8') as f:
         doc = json.load(f)
     out = {}
@@ -292,6 +249,7 @@ def load_tname(path):
             cid = entry.get('character_id')
             if cid is None or cid in out:
                 continue
+            # Skip variant-tag placeholders like "Leon_Towel".
             nm = entry.get('name', '') or ''
             if '_' in nm and ' ' not in nm:
                 continue
@@ -306,6 +264,7 @@ def load_tname(path):
 
 
 def load_tvoice(path):
+    """Parse t_voice.json. Returns dict id -> filename stem."""
     with open(path, 'r', encoding='utf-8') as f:
         doc = json.load(f)
     out = {}
@@ -320,15 +279,18 @@ def load_tvoice(path):
 
 
 def _resolve_tier(stem, suffix, inventory, prefix):
-    """Priority ladder within a single tier (avfc or btlface0_c).
-      1. {prefix}{suffix} — exact model match (respects the variant the
-         game says the character is wearing)
-      2. {prefix}{stem}   — bare (base outfit)
-      3. Any other {prefix}{stem}_* — lowest sorts first
-    Daybreak has no _c15/_c10 variants, so no special outfit priority."""
+    """Priority ladder within a single tier (avfc or btlface).
+      1. {prefix}{stem}_c15 — horizon canonical variant
+      2. {prefix}{stem}_c10
+      3. {prefix}{stem}    — bare
+      4. {prefix}{suffix}  — exact model match (when suffix differs)
+      5. Any other {prefix}{stem}_c## — lowest sorts first
+    Returns the filename or None."""
     tried = [
-        f'{prefix}{suffix}.webp',
+        f'{prefix}{stem}_c15.webp',
+        f'{prefix}{stem}_c10.webp',
         f'{prefix}{stem}.webp',
+        f'{prefix}{suffix}.webp',
     ]
     for c in tried:
         if c in inventory:
@@ -341,23 +303,27 @@ def _resolve_tier(stem, suffix, inventory, prefix):
 
 
 def portrait_for(entry):
-    """Tier order: avfc → btlface. No noteface tier in daybreak."""
+    """Resolve portrait filename for a t_name entry.
+    Tier order: avfc → btlface. No noteface tier in horizon.
+    Within each tier, _c15 wins over _c10 wins over bare."""
     if not entry:
         return None, None
     model = entry.get('model') or ''
     if not model.startswith('chr'):
         return None, None
-    suffix = model[len('chr'):]
+    suffix = model[len('chr'):]        # e.g. '0000_c15' or '0000'
     if not suffix:
         return None, None
-    stem = suffix.split('_')[0]
+    stem = suffix.split('_')[0]        # e.g. '0000'
 
     pf = _resolve_tier(stem, suffix, AVAILABLE_PORTRAITS, 'avfc')
     if pf:
         return pf, 'face'
+
     pf = _resolve_tier(stem, suffix, AVAILABLE_BTLFACE, 'btlface0_c')
     if pf:
         return pf, 'btl'
+
     return None, None
 
 
@@ -380,6 +346,8 @@ def voice_wrap(html_text, voice_file):
 
 
 def clean_text(lines, joiner):
+    """Join dialogue lines. `_decode_dialogue` already strips <...> tags;
+    this just joins + collapses whitespace for the search column."""
     text = joiner.join(line.strip() for line in lines if line.strip())
     if joiner == ' ':
         text = WHITESPACE_RE.sub(' ', text)
@@ -391,6 +359,8 @@ def sql_escape(s):
 
 
 def collect_files(root):
+    """Scan DIALOGUE_SUBDIRS under `root` and return {stem: full_path}.
+    Stems are unique across subdirs, so a flat dict is safe."""
     out = {}
     for sub in DIALOGUE_SUBDIRS:
         d = os.path.join(root, sub)
