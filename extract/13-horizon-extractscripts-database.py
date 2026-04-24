@@ -12,7 +12,6 @@ Format is identical to game 12 (db2) — differences from db2:
   - EN/JP script roots: `horizon.ing/script_eng`, `horizon.ing/script`
   - Portrait inventory: no noteface tier (0 files in horizon itp)
   - Portrait variant priority: _c15 > _c10 > bare > other
-  - Speaker names trimmed (horizon t_name has stray trailing spaces)
 """
 
 import ast
@@ -524,8 +523,6 @@ def main():
         entry = side_tname.get(chr_id)
         if not entry:
             return ''
-        # EN preferred: full_name_en. JP preferred: name. Horizon's t_name
-        # has stray trailing spaces (e.g. "Van ") — strip them.
         val = entry.get(side_field) or entry.get('name') or ''
         return val.strip()
 
@@ -559,7 +556,7 @@ def main():
             chr_id = jp_chr if jp_chr is not None else en_chr
 
             eng_chr = speaker(en_chr if en_t else chr_id, en_override,
-                              en_tname, 'full_name_en')
+                              en_tname, 'name')
             jpn_chr = speaker(jp_chr if jp_t else chr_id, jp_override,
                               jp_tname, 'name')
 
