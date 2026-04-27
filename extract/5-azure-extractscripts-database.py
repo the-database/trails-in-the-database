@@ -193,7 +193,16 @@ def parse_scena(path):
                 talk_func = args[12] if isinstance(args[12], int) else None
             else:
                 talk_scena = talk_func = None
-            npcs.append((name_str_idx, talk_scena, talk_func))
+            # Phantom NPC: position (0,0,0,0), no talk binding (255/255). The
+            # writers declare these to reserve a BuildStringList name slot
+            # without instantiating a real NPC — used as a scene-level
+            # identity hint for chr_ids that get reused across identities.
+            is_phantom = (
+                len(args) >= 13
+                and all(isinstance(args[i], int) and args[i] == 0 for i in range(4))
+                and talk_scena == 255 and talk_func == 255
+            )
+            npcs.append((name_str_idx, talk_scena, talk_func, is_phantom))
             continue
 
         if fn_idx < 0:
@@ -218,7 +227,23 @@ def parse_scena(path):
                 dialogues.append((fn_idx, name, char_id, npc_inline, lines,
                                   talk_actor, latched_name))
 
-    return {'string_list': string_list, 'npcs': npcs}, dialogues
+    addressed = {char_id for (_fn, _op, char_id, _ni, _ln, _ta, _l) in dialogues
+                 if isinstance(char_id, int)}
+    # Per-chr_id set of face_char prefixes seen in the scene's dialogues.
+    # Used downstream to confirm aliasing: two chr_ids speaking with the
+    # same portrait series in the same scene are likely the same actual
+    # character under different identities.
+    chr_id_faces = {}
+    for (_fn, _op, char_id, _ni, lines, _ta, _l) in dialogues:
+        if not isinstance(char_id, int):
+            continue
+        fc = _face_char_for(lines)
+        if fc is None:
+            continue
+        chr_id_faces.setdefault(char_id, set()).add(fc)
+    return {'string_list': string_list, 'npcs': npcs,
+            'addressed_chr_ids': addressed,
+            'chr_id_faces': chr_id_faces}, dialogues
 
 
 def _decode_dialogue(op_name, args):
@@ -255,19 +280,48 @@ def scena_num_for(stem):
 
 
 def resolve_speaker(char_id, op_name, npc_inline, latched, talk_actor,
-                    ctx, fn_idx, scena_num, side_tname):
+                    ctx, fn_idx, scena_num, side_tname,
+                    face_char=None, face_to_known=None,
+                    bsl_face_to_known=None):
     if op_name == 'NpcTalk':
         return (npc_inline or '').strip()
-    if latched:
-        return latched.strip()
-    if op_name == 'AnonymousTalk':
-        return ''
 
     npcs = ctx['npcs']
     sl = ctx['string_list']
 
     def _from_tname(cid):
         return side_tname.get(cid - PARTY_OFFSET, '')
+
+    # t_name lookup for party / named cast (chr_id 0x101+) takes priority
+    # over `latched`. SetChrName(name) is used to label AnonymousTalk(0xFF,
+    # ...) narrator lines — not to relabel a real character whose chr_id
+    # already identifies them via t_name. (Without this priority, a
+    # `SetChrName("Tio")` upstream incorrectly relabels every party
+    # member's subsequent dialogue as "Tio".)
+    if isinstance(char_id, int) and char_id >= PARTY_OFFSET:
+        name = _from_tname(char_id)
+        # Identity-alias override via global BSL-face map: when the
+        # dialogue's face-code prefix has a strong BSL-confirmed mapping
+        # (learned from any scene where Falcom bound a local NPC slot
+        # to a t_name name and used that face) to a different t_name
+        # name than the source's chr_id resolves to, prefer the
+        # face-implied name. Catches e.g. e2010 chr_id 0x106 (= Yin's
+        # t_name slot) speaking with face `107` (Rixia portrait series)
+        # in a scene that doesn't itself declare Rixia in BSL.
+        # Only fire when the resolved t_name name is a singleton in
+        # t_name — main-cast slots with multiple chip variants
+        # (Lloyd/Elie/Tio/Randy/Wazy) are protected from accidental
+        # redirects when a face is shared with another character via
+        # noisy BSL signals (e.g. Tio↔Zeit in Zero).
+        name_freq = ctx.get('tname_name_freq') or {}
+        if (face_char and bsl_face_to_known
+                and name_freq.get(name, 0) == 1):
+            bsl_idx = bsl_face_to_known.get(face_char)
+            if bsl_idx is not None:
+                bsl_name = side_tname.get(bsl_idx, '')
+                if bsl_name and bsl_name != name:
+                    return bsl_name
+        return name
 
     def _from_npc_idx(idx):
         if idx is None or idx < 0 or idx >= len(npcs):
@@ -287,8 +341,56 @@ def resolve_speaker(char_id, op_name, npc_inline, latched, talk_actor,
     def _from_local_npc(cid):
         return _from_npc_idx(cid - PARTY_SLOT_COUNT)
 
-    if char_id >= PARTY_OFFSET:
-        return _from_tname(char_id)
+    def _from_face(side):
+        """Face-code fallback: face_char prefix (e.g. '014') maps to a
+        known main-cast t_name chr_id. Prefers the BSL-derived map
+        (face → t_name_idx learned from local-NPC slots Falcom named
+        after t_name characters) over the chr_id-derived map, because
+        BSL signals are more reliable for shared faces — e.g. face
+        `107` is canonically Rixia (BSL signal) even though chr_id
+        0x106 (Yin's t_name slot) is the only named-cast user. Falls
+        back to face_to_known when no BSL mapping exists."""
+        if face_char is None:
+            return ''
+        if bsl_face_to_known:
+            bsl_idx = bsl_face_to_known.get(face_char)
+            if bsl_idx is not None:
+                return side.get(bsl_idx, '')
+        if face_to_known:
+            cid = face_to_known.get(face_char)
+            if cid is not None:
+                return side.get(cid, '')
+        return ''
+
+    # Precedence ladder (after the chr_id ≥ PARTY_OFFSET check above):
+    #   1. latched in t_name — source explicitly labeled this line with a
+    #      real character name (e.g. SetChrName("リーシャ") for Rixia).
+    #      Wins over face because Rixia/Yin share faces but the source's
+    #      scene label is canonical.
+    #   2. local NPC via BuildStringList for chr_id 0x08-0xFD — the
+    #      source's per-scene slot label (e.g. m4290 BuildStringList[5]
+    #      = "リーシャ" for chr_id 0xC). Wins over face for the same
+    #      reason as #1.
+    #   3. face — fallback when source has no specific label (typically
+    #      0xFE with no DeclNpc match, party slot, or generic narrator).
+    #   4. latched as-is — last-ditch even if not a known character.
+    latched_clean = latched.strip() if latched else ''
+    if latched_clean and latched_clean in side_tname.values():
+        return latched_clean
+
+    if isinstance(char_id, int) and PARTY_SLOT_COUNT <= char_id < 0xFE:
+        local = _from_local_npc(char_id)
+        if local:
+            return local
+
+    face = _from_face(side_tname)
+    if face:
+        return face
+
+    if latched_clean:
+        return latched_clean
+    if op_name == 'AnonymousTalk':
+        return ''
 
     if char_id == 0xFE:
         eff = talk_actor if talk_actor not in (None, 0xFE) else 0xFE
@@ -296,9 +398,8 @@ def resolve_speaker(char_id, op_name, npc_inline, latched, talk_actor,
             return _from_tname(eff)
         if eff != 0xFE and PARTY_SLOT_COUNT <= eff < 0xFE:
             return _from_local_npc(eff)
-        if eff != 0xFE and 0 <= eff < PARTY_SLOT_COUNT:
-            return ''  # party slot — unknown without party state
-        for i, (_, ts, tf) in enumerate(npcs):
+        for i, n in enumerate(npcs):
+            ts, tf = n[1], n[2]
             if ts == scena_num and tf == fn_idx:
                 return _from_npc_idx(i)
         return ''
@@ -306,7 +407,7 @@ def resolve_speaker(char_id, op_name, npc_inline, latched, talk_actor,
     if 0 <= char_id < PARTY_SLOT_COUNT:
         return ''
 
-    return _from_local_npc(char_id)
+    return _from_local_npc(char_id) if isinstance(char_id, int) else ''
 
 
 VOICE_CODE_LEN = 10
@@ -515,6 +616,136 @@ def align_scenes(en_d, jp_d):
     return aligned
 
 
+def _face_char_for(lines):
+    """Extract first face code's 3-digit char prefix from joined lines, or
+    None if no face code present. Used to bridge chr_id 0xFE / party-slot
+    dialogues to the face-implied speaker."""
+    if not lines:
+        return None
+    text = ''.join(lines)
+    m = FACE_RE.search(text)
+    if not m:
+        return None
+    code = m.group(1)
+    if len(code) < 5:
+        code = '0' * (5 - len(code)) + code
+    return code[:3]
+
+
+def _name_freq(tname):
+    """Count how many t_name entries share each name. Names appearing
+    only once are 'singleton' identities; names with multiple entries are
+    main-cast slots that have alternate chip variants and shouldn't be
+    redirected by phantom overrides."""
+    from collections import Counter
+    return Counter(v for v in tname.values() if v)
+
+
+def compute_phantom_overrides(ctx, tname):
+    """Collect BuildStringList names that match a t_name entry, paired
+    with the set of face-code prefixes that NPC's chr_id uses in the
+    scene. These are scene-local NPC slots Falcom has named after a
+    main-cast character (e.g. r3060 BSL[10]="リーシャ" backing chr_id
+    0x11 for post-reveal Rixia lines). When a named-cast chr_id
+    (≥ PARTY_OFFSET) shares a face prefix with one of these slots, it's
+    strong evidence the two chr_ids are the same character under
+    different identities, and we should redirect the named-cast
+    dialogue to the BSL name.
+
+    Returns list of (bsl_name, face_set) tuples, deduped by name."""
+    name_set = {v for v in tname.values() if v}
+    sl = ctx.get('string_list') or []
+    chr_id_faces = ctx.get('chr_id_faces') or {}
+    out = []
+    seen = set()
+    for npc_idx, n in enumerate(ctx.get('npcs') or []):
+        nsi = n[0]
+        if nsi is None or not (0 <= nsi < len(sl)):
+            continue
+        bsl_name = sl[nsi].strip()
+        if not bsl_name or bsl_name not in name_set or bsl_name in seen:
+            continue
+        chr_id = npc_idx + 8
+        face_set = chr_id_faces.get(chr_id) or set()
+        out.append((bsl_name, face_set))
+        seen.add(bsl_name)
+    return out
+
+
+def build_bsl_face_to_known(parsed_files, jp_tname):
+    """Global face_char → t_name_idx map learned from local NPCs whose
+    BuildStringList name matches a t_name entry. These BSL-named NPCs
+    are scenes where Falcom explicitly bound a face series to a
+    main-cast name (e.g. r3060 chr_id 0x11 = "リーシャ" with face
+    `107`), giving us ground truth for who that face really represents.
+
+    Used to redirect named-cast dialogues whose chr_id resolves to a
+    different t_name name than the face would imply — e.g. e2010
+    chr_id 0x106 (= Yin's t_name slot) speaking with face `107`
+    (Rixia's portraits) gets redirected to Rixia.
+
+    Requires ≥ 90% purity and ≥ 2 supporting samples to register, so a
+    one-off accidental face reuse doesn't pollute the map."""
+    from collections import Counter
+    name_to_idx = {}
+    for idx, nm in jp_tname.items():
+        if nm and nm not in name_to_idx:
+            name_to_idx[nm] = idx
+    face_votes = {}
+    for ctx, _ in parsed_files:
+        sl = ctx.get('string_list') or []
+        chr_id_faces = ctx.get('chr_id_faces') or {}
+        for npc_idx, n in enumerate(ctx.get('npcs') or []):
+            nsi = n[0]
+            if nsi is None or not (0 <= nsi < len(sl)):
+                continue
+            bsl_name = sl[nsi].strip()
+            if not bsl_name or bsl_name not in name_to_idx:
+                continue
+            tname_idx = name_to_idx[bsl_name]
+            chr_id = npc_idx + 8
+            for fc in chr_id_faces.get(chr_id, ()):
+                face_votes.setdefault(fc, Counter())[tname_idx] += 1
+    out = {}
+    for fc, cnt in face_votes.items():
+        top, top_n = cnt.most_common(1)[0]
+        total = sum(cnt.values())
+        if top_n / total >= 0.9 and total >= 2:
+            out[fc] = top
+    return out
+
+
+def build_face_to_known(parsed_files, jp_tname):
+    """Learn `face_char (3-digit prefix) -> known_chr_id` from dialogues
+    where chr_id resolves to a t_name main-cast entry. Used as a fallback
+    speaker resolution for chr_id 0xFE (current actor) and 0x00-0x07
+    (party slots) where the chr_id alone doesn't identify the character.
+
+    Only emits mappings with >= 90% purity and >= 3 supporting samples,
+    so noise from face-code-of-listener (vs. speaker) doesn't pollute."""
+    from collections import Counter
+    face_to_chrid = {}
+    for parsed in parsed_files:
+        for d in parsed:
+            scene, op, char_id, npc_inline, lines, talk_actor, latched = d
+            if not (isinstance(char_id, int) and char_id >= PARTY_OFFSET):
+                continue
+            cid = char_id - PARTY_OFFSET
+            if cid not in jp_tname:
+                continue
+            face_char = _face_char_for(lines)
+            if face_char is None:
+                continue
+            face_to_chrid.setdefault(face_char, Counter())[cid] += 1
+    out = {}
+    for fc, cnt in face_to_chrid.items():
+        top, top_n = cnt.most_common(1)[0]
+        total = sum(cnt.values())
+        if top_n / total >= 0.9 and total >= 3:
+            out[fc] = top
+    return out
+
+
 def main():
     en_files = collect_files(EN_SCENA_ROOT)
     jp_files = collect_files(JP_SCENA_ROOT)
@@ -524,13 +755,30 @@ def main():
     jp_tname = load_tname(JP_TNAME)
     print(f't_name  EN={len(en_tname)}  JP={len(jp_tname)}')
 
-    empty_ctx = {'string_list': [], 'npcs': []}
+    empty_ctx = {'string_list': [], 'npcs': [], 'addressed_chr_ids': set()}
+    en_name_freq = _name_freq(en_tname)
+    jp_name_freq = _name_freq(jp_tname)
+    # Pre-pass: parse all JP scenas and learn face_char -> known main-cast
+    # chr_id mapping. Face codes are language-independent so JP suffices.
+    print('Pre-pass: building face_char -> chr_id map...', file=sys.stderr)
+    parsed_jp = {stem: parse_scena(jp_files[stem]) for stem in jp_files}
+    face_to_known = build_face_to_known(
+        (dlg for _ctx, dlg in parsed_jp.values()), jp_tname,
+    )
+    print(f'  resolved {len(face_to_known)} face_char -> chr_id mappings', file=sys.stderr)
+    bsl_face_to_known = build_bsl_face_to_known(parsed_jp.values(), jp_tname)
+    print(f'  resolved {len(bsl_face_to_known)} BSL-confirmed face_char -> chr_id mappings', file=sys.stderr)
+
     rows = []
     stems = sorted(set(en_files) | set(jp_files))
     for stem in stems:
         scena_num = scena_num_for(stem)
         en_ctx, en_d = parse_scena(en_files[stem]) if stem in en_files else (empty_ctx, [])
-        jp_ctx, jp_d = parse_scena(jp_files[stem]) if stem in jp_files else (empty_ctx, [])
+        jp_ctx, jp_d = parsed_jp.get(stem, (empty_ctx, []))
+        en_ctx['phantom_overrides'] = compute_phantom_overrides(en_ctx, en_tname)
+        en_ctx['tname_name_freq'] = en_name_freq
+        jp_ctx['phantom_overrides'] = compute_phantom_overrides(jp_ctx, jp_tname)
+        jp_ctx['tname_name_freq'] = jp_name_freq
         pairs = align_scenes(en_d, jp_d)
         if not pairs:
             continue
@@ -546,12 +794,16 @@ def main():
             jp_lines = jp_t[4] if jp_t else []
             en_lines = en_t[4] if en_t else []
 
+            face_char = _face_char_for(jp_lines) or _face_char_for(en_lines)
+
             jpn_chr = resolve_speaker(
                 char_id, op_name,
                 jp_t[3] if jp_t else None,
                 jp_t[6] if jp_t else '',
                 jp_t[5] if jp_t else None,
                 jp_ctx, scene_idx, scena_num, jp_tname,
+                face_char=face_char, face_to_known=face_to_known,
+                bsl_face_to_known=bsl_face_to_known,
             )
             eng_chr = resolve_speaker(
                 char_id, op_name,
@@ -559,6 +811,8 @@ def main():
                 en_t[6] if en_t else '',
                 en_t[5] if en_t else None,
                 en_ctx, scene_idx, scena_num, en_tname,
+                face_char=face_char, face_to_known=face_to_known,
+                bsl_face_to_known=bsl_face_to_known,
             )
 
             jp_r = render_dialogue(jp_lines, wrap_voice=True) if jp_lines else None

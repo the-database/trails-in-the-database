@@ -156,7 +156,7 @@ LABEL_RE = re.compile(r'\d+@')
 FN_HEADER_RE = re.compile(r'(?m)^fn\s+(\w+)\s*\(')
 
 # Dialogue opcode: system[5,6](chrId, ...args...)
-DIALOGUE_CALL_RE = re.compile(r'\bsystem\s*\[\s*5\s*,\s*6\s*\]\s*\(')
+DIALOGUE_CALL_RE = re.compile(r'\bsystem\s*\[\s*5\s*,\s*(?:0|6|8)\s*\]\s*\(')
 
 # OP-27 equivalent: chr_set_display_name(chrId, "name")
 DISPLAY_NAME_CALL_RE = re.compile(r'\bchr_set_display_name\s*\(')
@@ -302,8 +302,9 @@ def _decode_dialogue(args):
     if not args:
         return None
     chr_id = _const_value(args[0])
+    # Variable chr_id (e.g. `var0`) — keep dialogue, resolve via voice prefix.
     if not isinstance(chr_id, int):
-        return None
+        chr_id = None
 
     lines = []
     voice_id = None
@@ -524,6 +525,40 @@ def align_scenes(en_d, jp_d):
     return aligned
 
 
+def build_chr_alias(parsed_files, jp_tname, tvoice):
+    """Build (chr_alias, voice_prefix_to_known) maps from voice prefixes.
+
+    Voice files are recorded one-per-VA. Two uses:
+      - chr_alias[unk_chr_id] -> known_chr_id (for IDs absent from t_name)
+      - voice_prefix_to_known[prefix] -> known_chr_id (for runtime variable
+        chr_ids that can't be parsed at all)."""
+    from collections import Counter
+    prefix_known = {}
+    unk_prefixes = {}
+    for parsed in parsed_files:
+        for d in parsed:
+            chr_id, voice_id = d[1], d[3]
+            if voice_id is None:
+                continue
+            fn = tvoice.get(voice_id) or ''
+            if not fn or not fn.startswith('v'):
+                continue
+            prefix = fn[:4]
+            if chr_id in jp_tname:
+                prefix_known.setdefault(prefix, Counter())[chr_id] += 1
+            elif chr_id is not None:
+                unk_prefixes.setdefault(chr_id, Counter())[prefix] += 1
+    voice_prefix_to_known = {
+        prefix: cnt.most_common(1)[0][0] for prefix, cnt in prefix_known.items()
+    }
+    alias = {}
+    for unk_cid, prefixes in unk_prefixes.items():
+        dominant_prefix, _ = prefixes.most_common(1)[0]
+        if dominant_prefix in voice_prefix_to_known:
+            alias[unk_cid] = voice_prefix_to_known[dominant_prefix]
+    return alias, voice_prefix_to_known
+
+
 def main():
     en_files = collect_files(EN_ROOT)
     jp_files = collect_files(JP_ROOT)
@@ -534,27 +569,64 @@ def main():
     tvoice = load_tvoice(JP_TVOICE)
     print(f't_name  EN={len(en_tname)}  JP={len(jp_tname)}  t_voice={len(tvoice)}')
 
-    def speaker(chr_id, override, side_tname, side_field):
-        if override:
-            return override
-        if chr_id in ANONYMOUS_CHR_IDS:
+    print('Pre-pass: building chr_id alias map...', file=sys.stderr)
+    parsed_jp = {stem: parse_script(jp_files[stem]) for stem in jp_files}
+    chr_alias, voice_prefix_to_known = build_chr_alias(parsed_jp.values(), jp_tname, tvoice)
+    print(f'  resolved {len(chr_alias)} unknown chr_ids via voice-prefix bridge', file=sys.stderr)
+
+    def _resolve_via_voice(voice_id, side_tname, side_field):
+        if voice_id is None:
             return ''
-        entry = side_tname.get(chr_id)
+        fn = tvoice.get(voice_id) or ''
+        if len(fn) < 4:
+            return ''
+        known_cid = voice_prefix_to_known.get(fn[:4])
+        if known_cid is None:
+            return ''
+        entry = side_tname.get(known_cid)
         if not entry:
             return ''
         return entry.get(side_field) or entry.get('name') or ''
 
-    def portrait(chr_id):
+    def speaker(chr_id, override, side_tname, side_field, voice_id=None):
+        if override:
+            return override
+        if chr_id in ANONYMOUS_CHR_IDS:
+            return ''
+        if chr_id is None:
+            return _resolve_via_voice(voice_id, side_tname, side_field)
+        entry = side_tname.get(chr_id)
+        if not entry and chr_id in chr_alias:
+            entry = side_tname.get(chr_alias[chr_id])
+        if not entry:
+            return ''
+        return entry.get(side_field) or entry.get('name') or ''
+
+    def portrait(chr_id, voice_id=None):
         if chr_id in ANONYMOUS_CHR_IDS:
             return None, None
+        if chr_id is None:
+            if voice_id is None:
+                return None, None
+            fn = tvoice.get(voice_id) or ''
+            if len(fn) < 4:
+                return None, None
+            known_cid = voice_prefix_to_known.get(fn[:4])
+            if known_cid is None:
+                return None, None
+            entry = jp_tname.get(known_cid) or en_tname.get(known_cid)
+            return portrait_for(entry)
         entry = jp_tname.get(chr_id) or en_tname.get(chr_id)
+        if not entry and chr_id in chr_alias:
+            aliased = chr_alias[chr_id]
+            entry = jp_tname.get(aliased) or en_tname.get(aliased)
         return portrait_for(entry)
 
     rows = []
     stems = sorted(set(en_files) | set(jp_files))
     for stem in stems:
         en_d = parse_script(en_files[stem]) if stem in en_files else []
-        jp_d = parse_script(jp_files[stem]) if stem in jp_files else []
+        jp_d = parsed_jp.get(stem, []) if stem in jp_files else []
         pairs = align_scenes(en_d, jp_d)
         if not pairs:
             continue
@@ -572,17 +644,17 @@ def main():
             )
             scene = jp_scene if jp_t else en_scene
             chr_id = jp_chr if jp_chr is not None else en_chr
+            vid = jp_voice or en_voice
 
             eng_chr = speaker(en_chr if en_t else chr_id, en_override,
-                              en_tname, 'name')
+                              en_tname, 'name', voice_id=vid)
             jpn_chr = speaker(jp_chr if jp_t else chr_id, jp_override,
-                              jp_tname, 'name')
+                              jp_tname, 'name', voice_id=vid)
 
-            pfile, tier = portrait(chr_id) if chr_id is not None else (None, None)
+            pfile, tier = portrait(chr_id, voice_id=vid)
             pc_icon = pc_icon_html(pfile, tier)
 
             jp_html = clean_text(jp_lines, '<br/>')
-            vid = jp_voice or en_voice
             vfile = tvoice.get(vid) if vid is not None else None
             if vfile and jp_html:
                 jp_html = voice_wrap(jp_html, vfile)

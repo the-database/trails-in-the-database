@@ -26,6 +26,16 @@ OUTPUT = 'reverie.sql'
 # Template/system files that haji omitted. Their ChrTalks are boilerplate.
 SKIP_STEMS = {'PersonalTemplate', 'be0000', 'infsys'}
 
+# JP-side filename overrides for cases where the canonical .py was
+# overwritten by a dev/test artifact and the real version was preserved
+# as a Windows "copy of" file. Keyed by stem.
+JP_FILE_OVERRIDES = {'h0000': 'h0000 - コピー.py'}
+
+# Broken `import <stem with dashes>_hook` line introduced by Windows-style
+# rename of files in the override set. Patched out before `ast.parse`.
+HOOK_PATCH_RE = re.compile(
+    r'^(\s*)import\s+\S+\s*-\s*コピー_hook\s*$', re.MULTILINE)
+
 # The 71 face-portrait files shipped at itp/10/{file}. Used to filter
 # the filename derived from t_name.py's faceTexture/model fields (which
 # can reference sprites that weren't shipped). Snapshot of the
@@ -213,6 +223,9 @@ def parse_script(path, chr_key_to_id):
     """
     with open(path, 'r', encoding='utf-8') as f:
         src = f.read()
+    # Patch the broken `import <stem>_hook` line in JP_FILE_OVERRIDES files
+    # (the one コピー file has a Windows-rename artifact in its hook import).
+    src = HOOK_PATCH_RE.sub(r'\1pass  # patched (broken hook import)', src)
     try:
         tree = ast.parse(src, filename=path)
     except SyntaxError as e:
@@ -273,7 +286,35 @@ def parse_script(path, chr_key_to_id):
                     display = name_node.value
                     if display:
                         createchr_names.setdefault(char, display)
-    return dialogues, createchr_names
+    # Drop adjacent duplicates: source uses Jump/label branching where the
+    # same logical line is emitted N times across alternate branches (only
+    # one runs at runtime). Two patterns:
+    #   - exact dup (h2600): same (char, voice, text) — branch A and B
+    #     both reference the same recorded VA line.
+    #   - alternate-VA (d7010): same (char, text) with DIFFERENT voice IDs
+    #     — speaker slot can be one of N party members, each with their
+    #     own VA recording for the same line; cascading If/Jump picks one.
+    # Both have voices on every branch — only dedup when prev AND current
+    # both carry non-None voice IDs. Unvoiced same-text adjacent dialogues
+    # (d8071 pattern) are slight particle variants in JP that translated to
+    # identical EN; deduping there causes EN<JP imbalance.
+    deduped = []
+    prev_sig = None
+    prev_voiced = False
+    for d in dialogues:
+        scene, char, parts, dkind, override, voice = d
+        is_voiced = voice is not None
+        if char is not None and parts and is_voiced:
+            sig = (scene, char, tuple(parts), dkind)
+            if sig == prev_sig and prev_voiced:
+                continue
+            prev_sig = sig
+            prev_voiced = True
+        else:
+            prev_sig = None
+            prev_voiced = False
+        deduped.append(d)
+    return deduped, createchr_names
 
 
 def normalize_name(raw):
@@ -413,15 +454,121 @@ def collect_files(root, *parts):
     d = os.path.join(root, *parts)
     if not os.path.isdir(d):
         return {}
-    return {
+    # Files used as override targets — exclude their natural stems so we
+    # don't emit a phantom JP-only entry for the override file itself.
+    override_targets = (
+        {v[:-3] for v in JP_FILE_OVERRIDES.values()} if root == JP_ROOT else set()
+    )
+    out = {
         entry[:-3]: os.path.join(d, entry)
         for entry in os.listdir(d)
-        if entry.endswith('.py') and entry[:-3] not in SKIP_STEMS
+        if entry.endswith('.py')
+        and entry[:-3] not in SKIP_STEMS
+        and entry[:-3] not in override_targets
     }
+    # JP-side: redirect specific stems to their override file (e.g. the
+    # real h0000 lives at "h0000 - コピー.py" — see JP_FILE_OVERRIDES).
+    if root == JP_ROOT:
+        for stem, override_name in JP_FILE_OVERRIDES.items():
+            override_path = os.path.join(d, override_name)
+            if os.path.exists(override_path):
+                out[stem] = override_path
+    return out
 
 
 def sql_escape(s):
     return s.replace('\\', '\\\\').replace("'", "''").replace('\x1a', '\\Z')
+
+
+def _voice_prefix(filename):
+    """Reverie voice filenames look like `v10_1_1234`, `v16_c_0058` — the
+    character identity lives in the leading `v##` portion (everything up
+    to the first underscore)."""
+    if not filename or not filename.startswith('v'):
+        return ''
+    us = filename.find('_')
+    return filename[:us] if us > 0 else filename
+
+
+def build_chr_alias(parsed_files, jp_tname, chr_key_to_id, tvoice):
+    """Learn `voice_prefix -> known_chr_id` from dialogues with chr_ids that
+    resolve to a t_name entry. Used as a last-ditch speaker fallback for
+    chr_ids absent from t_name OR when chr_id couldn't be parsed at all
+    (variable expression — `char` is None)."""
+    from collections import Counter
+    prefix_known = {}
+    for parsed in parsed_files:
+        for d in parsed:
+            scene, char, parts, dkind, override, voice = d
+            if voice is None or char is None:
+                continue
+            if char[0] == 'id':
+                cid = char[1]
+            else:
+                cid = chr_key_to_id.get(char[1])
+            if cid is None or cid not in jp_tname:
+                continue
+            fn = tvoice.get(voice) or ''
+            prefix = _voice_prefix(fn)
+            if not prefix:
+                continue
+            prefix_known.setdefault(prefix, Counter())[cid] += 1
+    return {prefix: cnt.most_common(1)[0][0]
+            for prefix, cnt in prefix_known.items()}
+
+
+def _lcs_pairs(a, b):
+    """LCS alignment on (scene_idx, kind, char) signatures. Returns a list
+    of (a_item_or_None, b_item_or_None) — matched items paired, EN/JP-only
+    insertions emitted as singletons. char tuples are hashable."""
+    def sig(d):
+        return (d[0], d[3], d[1])
+    n, m = len(a), len(b)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n):
+        ai = sig(a[i])
+        for j in range(m):
+            if ai == sig(b[j]):
+                dp[i + 1][j + 1] = dp[i][j] + 1
+            else:
+                dp[i + 1][j + 1] = max(dp[i + 1][j], dp[i][j + 1])
+    out = []
+    i, j = n, m
+    while i > 0 and j > 0:
+        if sig(a[i - 1]) == sig(b[j - 1]):
+            out.append((a[i - 1], b[j - 1]))
+            i -= 1
+            j -= 1
+        elif dp[i - 1][j] >= dp[i][j - 1]:
+            out.append((a[i - 1], None))
+            i -= 1
+        else:
+            out.append((None, b[j - 1]))
+            j -= 1
+    while i > 0:
+        out.append((a[i - 1], None))
+        i -= 1
+    while j > 0:
+        out.append((None, b[j - 1]))
+        j -= 1
+    out.reverse()
+    return out
+
+
+def align_scenes(en_d, jp_d):
+    """Align dialogues scene-by-scene via LCS on (scene_idx, kind, char).
+    Scene counts match across EN/JP, so grouping by scene_idx is a safe
+    reset boundary."""
+    en_by = {}
+    jp_by = {}
+    for d in en_d:
+        en_by.setdefault(d[0], []).append(d)
+    for d in jp_d:
+        jp_by.setdefault(d[0], []).append(d)
+    aligned = []
+    for scene in sorted(set(en_by) | set(jp_by)):
+        aligned.extend(_lcs_pairs(en_by.get(scene, []), jp_by.get(scene, [])))
+    return aligned
 
 
 def main():
@@ -476,6 +623,30 @@ def main():
             jpn_names.setdefault(k, v)
     print(f'createchr names  EN={len(eng_names)}  JP={len(jpn_names)}')
 
+    # Voice-prefix bridge: learn `voice_prefix -> known_chr_id` from
+    # dialogues with chr_ids that resolve to t_name. Used as a fallback for
+    # speakers when char is None (variable expression) or chr_id isn't in
+    # t_name. JP scena+talk dialogues are the source — voice_id is
+    # language-independent.
+    all_jp_dialogues = []
+    for path in list(jp_scena.values()) + list(jp_talk.values()):
+        d, _ = get(path)
+        all_jp_dialogues.append(d)
+    voice_prefix_to_known = build_chr_alias(all_jp_dialogues, jp_tname,
+                                             chr_key_to_id, tvoice)
+    print(f'voice prefix -> chr_id map: {len(voice_prefix_to_known)} entries')
+
+    def resolve_via_voice(voice_id, side_tname):
+        if voice_id is None:
+            return ''
+        prefix = _voice_prefix(tvoice.get(voice_id, ''))
+        if not prefix:
+            return ''
+        cid = voice_prefix_to_known.get(prefix)
+        if cid is None or cid not in side_tname:
+            return ''
+        return side_tname[cid].get('name', '')
+
     def resolve_chrid(char, talk_fallback_chrid=None):
         """Map a ChrTalk char arg to a numeric chr_id. Talk files use
         placeholder ids (0x1AC3 etc.) for the file's titular speaker;
@@ -497,9 +668,10 @@ def main():
             return None
         return name2_to_chrid.get(stem[3:])
 
-    def speaker_name(char, override, side_tname, side_create, talk_fb):
+    def speaker_name(char, override, side_tname, side_create, talk_fb, voice_id=None):
         """Resolve the speaker display name for one side (EN or JP).
-        Priority: OP_27 override > t_name[chrId] > CreateChr display > ''."""
+        Priority: OP_27 override > t_name[chrId] > CreateChr display
+                > voice-prefix bridge > ''."""
         if override:
             return override
         chrid = resolve_chrid(char, talk_fb)
@@ -507,22 +679,28 @@ def main():
             return side_tname[chrid]['name']
         if char in side_create:
             return side_create[char]
-        return ''
+        return resolve_via_voice(voice_id, side_tname)
 
-    def row_portrait(char, talk_fb):
+    def row_portrait(char, talk_fb, voice_id=None):
         chrid = resolve_chrid(char, talk_fb)
+        if chrid is None and voice_id is not None:
+            prefix = _voice_prefix(tvoice.get(voice_id, ''))
+            chrid = voice_prefix_to_known.get(prefix)
         if chrid is None:
             return None
         entry = jp_tname.get(chrid) or en_tname.get(chrid)
         return portrait_from_tname(entry) if entry else None
 
-    def row_note(char, talk_fb):
+    def row_note(char, talk_fb, voice_id=None):
         """Fallback icon for characters without a shipped avfc portrait.
         Note filenames are keyed by model number (same as avfc), not by
         chrId — e.g. Illia has chrId 0x0107 but model C_CHR109, giving
         note_chr109.webp. Strip the C_CHR prefix off the t_name entry's
         model field to build the filename."""
         chrid = resolve_chrid(char, talk_fb)
+        if chrid is None and voice_id is not None:
+            prefix = _voice_prefix(tvoice.get(voice_id, ''))
+            chrid = voice_prefix_to_known.get(prefix)
         if chrid is None:
             return None
         entry = jp_tname.get(chrid) or en_tname.get(chrid)
@@ -558,46 +736,52 @@ def main():
             jp_d, _ = get(jp_map.get(stem))
             talk_fb = talk_fallback(stem) if kind == 'talk' else None
 
-            if en_d and jp_d and len(en_d) != len(jp_d):
-                print(f'WARN {kind}/{stem}: EN={len(en_d)} JP={len(jp_d)}',
-                      file=sys.stderr)
+            pairs = align_scenes(en_d, jp_d)
+            unpaired = sum(1 for e, j in pairs if e is None or j is None)
+            if unpaired:
+                print(f'WARN {kind}/{stem}: {unpaired} unpaired rows '
+                      f'(EN={len(en_d)} JP={len(jp_d)})', file=sys.stderr)
 
-            n = max(len(en_d), len(jp_d))
-            for i in range(n):
-                if i < len(en_d):
-                    en_scene, en_char, en_parts, _en_kind, en_override, en_voice = en_d[i]
+            for en_t, jp_t in pairs:
+                if en_t:
+                    en_scene, en_char, en_parts, _en_kind, en_override, en_voice = en_t
                 else:
                     en_scene, en_char, en_parts, en_override, en_voice = None, None, [], '', None
-                if i < len(jp_d):
-                    jp_scene, jp_char, jp_parts, _jp_kind, jp_override, jp_voice = jp_d[i]
+                if jp_t:
+                    jp_scene, jp_char, jp_parts, _jp_kind, jp_override, jp_voice = jp_t
                 else:
                     jp_scene, jp_char, jp_parts, jp_override, jp_voice = None, None, [], '', None
                 scene = jp_scene if jp_scene is not None else (en_scene if en_scene is not None else 0)
 
+                vid = jp_voice or en_voice
                 # Speakers: t_name[chrId] is authoritative; OP_27 overrides
                 # it for context-specific labels (e.g. '《Ｃ》', '謎の声').
-                en_raw = speaker_name(en_char, en_override, en_tname, eng_names, talk_fb)
-                jp_raw = speaker_name(jp_char, jp_override, jp_tname, jpn_names, talk_fb)
-                # Cross-side fallback when one side's char is absent.
-                if not en_raw and jp_char:
-                    en_raw = speaker_name(jp_char, '', en_tname, eng_names, talk_fb)
-                if not jp_raw and en_char:
-                    jp_raw = speaker_name(en_char, '', jp_tname, jpn_names, talk_fb)
+                en_raw = speaker_name(en_char, en_override, en_tname, eng_names, talk_fb, voice_id=vid)
+                jp_raw = speaker_name(jp_char, jp_override, jp_tname, jpn_names, talk_fb, voice_id=vid)
+                # Cross-side fallback when one side's char is absent (only
+                # when both sides actually have dialogue — don't synthesize
+                # a name on a side that has no text).
+                if en_t and jp_t:
+                    if not en_raw and jp_char:
+                        en_raw = speaker_name(jp_char, '', en_tname, eng_names, talk_fb, voice_id=vid)
+                    if not jp_raw and en_char:
+                        jp_raw = speaker_name(en_char, '', jp_tname, jpn_names, talk_fb, voice_id=vid)
                 eng_chr = normalize_name(en_raw)
                 jpn_chr = normalize_name(jp_raw)
 
-                pfile = row_portrait(jp_char, talk_fb) or row_portrait(en_char, talk_fb)
+                pfile = (row_portrait(jp_char, talk_fb, voice_id=vid)
+                         or row_portrait(en_char, talk_fb, voice_id=vid))
                 if pfile:
                     pc_icon = f'<img class="itp-face3" src="itp/10/{pfile}"/>'
                 else:
-                    nfile = row_note(jp_char, talk_fb) or row_note(en_char, talk_fb)
+                    nfile = (row_note(jp_char, talk_fb, voice_id=vid)
+                             or row_note(en_char, talk_fb, voice_id=vid))
                     pc_icon = f'<img class="itp-note3" src="itp/10/{nfile}"/>' if nfile else ''
 
                 jp_html = clean_text(jp_parts, '<br/>')
                 # Voice: JP audio file wraps the JP HTML. EN and JP use the
                 # same voice code for the same dialogue — prefer JP but
                 # accept EN's voice id as fallback (pairing is positional).
-                vid = jp_voice or en_voice
                 vfile = tvoice.get(vid) if vid is not None else None
                 if vfile and jp_html:
                     jp_html = voice_wrap(jp_html, vfile)
