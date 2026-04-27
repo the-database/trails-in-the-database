@@ -539,7 +539,7 @@ def render_dialogue(lines, wrap_voice):
 
 def voice_wrap(html_text, voice_id):
     return (
-        f'<audio id="v{voice_id}">'
+        f'<audio id="v{voice_id}" preload="none">'
         f'<source src="talk/{GAME_ID}/v{voice_id}.opus" type="audio/ogg; codecs=opus">'
         f'</audio>'
         f'<a href="javascript:void(0)" '

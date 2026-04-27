@@ -432,7 +432,7 @@ def pc_icon_html(filename, tier):
 
 def voice_wrap(html_text, voice_file):
     return (
-        f'<audio id="{voice_file}">'
+        f'<audio id="{voice_file}" preload="none">'
         f'<source src="talk/{GAME_ID}/{voice_file}.opus" type="audio/ogg; codecs=opus">'
         f'</audio>'
         f'<a href="javascript:void(0)" '

@@ -610,7 +610,7 @@ def apply_voice_codes(text, voice_files):
     for i in range(len(lines)):
         if i < len(voice_files) and not voice_files[i].startswith('pc'):
             new_lines.append(
-                f'<audio id="{voice_files[i]}"><source src="talk/6/{voice_files[i]}.ogg" '
+                f'<audio id="{voice_files[i]}" preload="none"><source src="talk/6/{voice_files[i]}.ogg" '
                 f'type="audio/ogg; codecs=vorbis"></audio><a href="javascript:void(0)" '
                 f'onclick="document.getElementById(\'{voice_files[i]}\').play()">{lines[i]}</a>'
             )

@@ -568,7 +568,7 @@ def apply_voice_codes(text, voice_files):
     for i in range(len(lines)):
         if i < len(voice_files):
             new_lines.append(
-                f'<audio id="{voice_files[i]}"><source src="talk/8/{voice_files[i]}.opus" '
+                f'<audio id="{voice_files[i]}" preload="none"><source src="talk/8/{voice_files[i]}.opus" '
                 f'type="audio/ogg; codecs=opus"></audio><a href="javascript:void(0)" '
                 f'onclick="document.getElementById(\'{voice_files[i]}\').play()">{lines[i]}</a>'
             )

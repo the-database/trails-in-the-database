@@ -1177,7 +1177,7 @@ def main():
 
                         if voice:
                             # print('a voice!!!')
-                            pages[j] = b'<audio id="ch%s"><source src="talk/1/ch%s.ogg" ' \
+                            pages[j] = b'<audio id="ch%s" preload="none"><source src="talk/1/ch%s.ogg" ' \
                                        b'type="audio/ogg"></audio><a href="javascript:void(0)" ' \
                                        b'onclick="document.getElementById(\'ch%s\').play()">%s</a>' \
                                        % (voice.group(1), voice.group(1), voice.group(1), pages[j])

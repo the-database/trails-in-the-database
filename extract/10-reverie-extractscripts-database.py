@@ -350,7 +350,7 @@ def voice_wrap(html_text, voice_file):
     attributes in onclick stay single-quoted; sql_escape later doubles
     them for Postgres."""
     return (
-        f'<audio id="{voice_file}">'
+        f'<audio id="{voice_file}" preload="none">'
         f'<source src="talk/10/{voice_file}.opus" type="audio/ogg; codecs=opus">'
         f'</audio>'
         f'<a href="javascript:void(0)" '
