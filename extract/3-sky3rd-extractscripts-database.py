@@ -1654,10 +1654,9 @@ def main():
                         icon = re.search(rb'#(\d+?)F', pages[j])
 
                         if voice:
-                            pages[j] = b'<audio id="ch%s" preload="none"><source src="talk/3/ch%s.ogg" ' \
-                                       b'type="audio/ogg"></audio><a href="javascript:void(0)" ' \
-                                       b'onclick="document.getElementById(\'ch%s\').play()">%s</a>' \
-                                       % (voice.group(1), voice.group(1), voice.group(1), pages[j])
+                            pages[j] = b'<a href="javascript:void(0)" class="dialogue-line" ' \
+                                       b'data-audio="talk/3/ch%s.ogg">%s</a>' \
+                                       % (voice.group(1), pages[j])
                         if icon:
                             icon_index = int(icon.group(1).decode(jpn_encode))
                             if len(str(icon_index)) <= 3:

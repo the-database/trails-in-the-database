@@ -512,7 +512,7 @@ def _render_segment(seg_text, html):
 
 def render_dialogue(lines, wrap_voice):
     """Returns dict with html, search, faces_html. When wrap_voice is True,
-    each #NV voice segment in the html is wrapped in its own <audio> link;
+    each #NV voice segment in the html is wrapped in its own <a> link;
     when False, voice markers are stripped."""
     raw = ''.join(lines)
     faces_html, raw = _extract_faces(raw)
@@ -539,11 +539,8 @@ def render_dialogue(lines, wrap_voice):
 
 def voice_wrap(html_text, voice_id):
     return (
-        f'<audio id="v{voice_id}" preload="none">'
-        f'<source src="talk/{GAME_ID}/v{voice_id}.opus" type="audio/ogg; codecs=opus">'
-        f'</audio>'
-        f'<a href="javascript:void(0)" '
-        f'onclick="document.getElementById(\'v{voice_id}\').play()">'
+        f'<a href="javascript:void(0)" class="dialogue-line" '
+        f'data-audio="talk/{GAME_ID}/v{voice_id}.opus">'
         f'{html_text}</a>'
     )
 
