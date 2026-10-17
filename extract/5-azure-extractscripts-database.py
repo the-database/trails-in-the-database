@@ -164,9 +164,20 @@ def parse_scena(path):
 
     for stmt in main_fn.body:
         if isinstance(stmt, ast.FunctionDef):
-            fn_idx += 1
-            talk_actor = None
-            latched_name = ''
+            # EDDecompiler emits two kinds of FunctionDef at this level:
+            # `Function_N_XXXX` (real source scenes) and `lambda_XXXX`
+            # (inline event-action closures, defined inside the body of
+            # the surrounding Function_N). DeclNpc.talk_func references
+            # the source N — so a naive position counter that increments
+            # on lambdas drifts off and breaks the 0xFE TalkBegin
+            # resolver. Parse N from the name directly; ignore lambdas.
+            if stmt.name.startswith('Function_'):
+                try:
+                    fn_idx = int(stmt.name.split('_', 2)[1])
+                except (ValueError, IndexError):
+                    fn_idx += 1
+                talk_actor = None
+                latched_name = ''
             continue
 
         if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
@@ -507,6 +518,10 @@ def _render_segment(seg_text, html):
         text = text.replace('\x02\x03', ' ').replace('\x01', ' ')
         text = WHITESPACE_RE.sub(' ', text)
     text = text.replace('\x02', '').replace('\x03', '')
+    # Decompiler mismaps Shift-JIS NEC `♥` (0x87 0x9D) onto `㈱`
+    # (0x87 0x9F) — both bytes are CP932 NEC special chars and the
+    # lookup is off by one. Patch back here before emit.
+    text = text.replace('㈱', '♥')
     return text.strip()
 
 
@@ -813,6 +828,9 @@ def main():
             )
 
             jp_r = render_dialogue(jp_lines, wrap_voice=True) if jp_lines else None
+            # The EN patch puts `è` (Agnès) at CP932 0x875F, which decodes as
+            # the NEC `㍉`. EN-only: in JP text 0x875F really is `㍉`.
+            en_lines = [l.replace('㍉', 'è') for l in en_lines] if en_lines else en_lines
             en_r = render_dialogue(en_lines, wrap_voice=False) if en_lines else None
 
             jp_html = jp_r['html'] if jp_r else ''

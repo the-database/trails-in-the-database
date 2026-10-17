@@ -1330,6 +1330,7 @@ def main():
                     pages = splitbodybytes[i].split(b'\x02\x03')
                     icons = []
                     pc_icons = []
+                    voice_ids = []  # per-page voice id; None if page has no audio
 
                     # print(i,full_eng_lines[i])
                     pc_icon = re.finditer(rb'#(\d+?)F', full_eng_lines[i])
@@ -1353,10 +1354,7 @@ def main():
                         voice = re.search(rb'#(\d+?)V', pages[j])
                         icon = re.search(rb'#(\d+?)F', pages[j])
 
-                        if voice:
-                            pages[j] = b'<a href="javascript:void(0)" class="dialogue-line" ' \
-                                       b'data-audio="talk/2/ch%s.ogg">%s</a>' \
-                                       % (voice.group(1), pages[j])
+                        voice_ids.append(voice.group(1).decode(jpn_encode) if voice else None)
                         if icon:
                             icon_index = int(icon.group(1).decode(jpn_encode))
                             if len(str(icon_index)) <= 3:
@@ -1367,6 +1365,19 @@ def main():
                                 icon_str = '<img class="itp" src="itp/2/evo/c_ka%s.webp"/> ' \
                                            % icon_index
                             icons.append(icon_str)
+
+                    # Wrap jpn_html_text pages with audio anchors using voice_ids
+                    # collected from the eng-side pages (positionally aligned).
+                    if any(voice_ids):
+                        jpn_pages_split = jpn_html_text.split('<br/><br/>')
+                        for j in range(min(len(voice_ids), len(jpn_pages_split))):
+                            if voice_ids[j]:
+                                jpn_pages_split[j] = (
+                                    '<a href="javascript:void(0)" class="dialogue-line" '
+                                    'data-audio="talk/2/ch%s.ogg">%s</a>'
+                                    % (voice_ids[j], jpn_pages_split[j])
+                                )
+                        jpn_html_text = '<br/><br/>'.join(jpn_pages_split)
 
                     try:
                         display_text = re.sub(rb'#\d+[A-Z]|[\x00-\x09]', b'',

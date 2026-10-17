@@ -187,6 +187,22 @@ AVAILABLE_BTLFACE = {
 ANGLE_TAG_RE = re.compile(r'<[^>]*>')
 WHITESPACE_RE = re.compile(r'[ \t]+')
 
+# Furigana: `<R>翠耀石</Rエスメラス>` — base between `<R>` and `</R`, reading
+# before the closing `>`.
+#
+# Both halves are deliberately confined to one string argument (`[^"<>]`).
+# `<R>` doubles as a plain formatting code, and every JP script carries a
+# handful of unclosed ones (e.g. `"<C1><R>おや、村は…"`). A `.*?` match would
+# sail past those into the *next* dialogue call and swallow hundreds of
+# characters of unrelated text before finding some later `</R`.
+RUBY_RE = re.compile(r'<R>([^"<>]*)</R([^"<>]*)>')
+
+# Furigana has to outlive ANGLE_TAG_RE so that clean_text() can render it
+# differently per column, so it is parked behind sentinels first. \x01-\x03
+# occur nowhere in the game text.
+RUBY_OPEN, RUBY_SEP, RUBY_CLOSE = '\x01', '\x02', '\x03'
+RUBY_MARK_RE = re.compile(r'\x01([^\x01-\x03]*)\x02([^\x01-\x03]*)\x03')
+
 # `NNN@` line-number labels are sprinkled before statements and inside
 # argument lists. They're not part of the logic — strip before parsing.
 LABEL_RE = re.compile(r'\d+@')
@@ -310,8 +326,13 @@ def parse_script(path):
             if len(args) >= 2:
                 cid = _const_value(args[0])
                 nm = _const_value(args[1])
-                if isinstance(cid, int) and isinstance(nm, str) and nm:
-                    latched[cid] = nm
+                if isinstance(cid, int) and isinstance(nm, str):
+                    # Empty name = the game's "reset to the real name"
+                    # signal; clear the latch instead of ignoring it.
+                    if nm:
+                        latched[cid] = nm
+                    else:
+                        latched.pop(cid, None)
             continue
 
         if kind == 'dialogue':
@@ -352,7 +373,9 @@ def _decode_dialogue(args):
     while i < len(args):
         v = _const_value(args[i])
         if isinstance(v, str):
-            cleaned = ANGLE_TAG_RE.sub('', v).strip()
+            # Park furigana first; whatever `<R>` survives that pass was a
+            # formatting code, and gets stripped like any other tag.
+            cleaned = ANGLE_TAG_RE.sub('', _mark_ruby(v)).strip()
             if cleaned:
                 lines.append(cleaned)
         elif isinstance(v, int) and v == 11 and i + 1 < len(args):
@@ -474,12 +497,56 @@ def voice_wrap(html_text, voice_file):
     )
 
 
+def _mark_ruby(text):
+    """Park `<R>base</Rreading>` furigana behind sentinels.
+
+    Called before the generic tag strip so ANGLE_TAG_RE cannot eat the
+    reading, which lives inside the closing tag rather than between the tags.
+    """
+    def park(m):
+        base, reading = m.group(1).strip(), m.group(2).strip()
+        # `<R>本題</R>` with no reading is emphasis markup, not furigana —
+        # keep the base and drop the tags rather than emit an empty <rt>.
+        #
+        # Trim both halves: a padded base (`<R> Ｂ Ｏ Ｅ</R…>`) used to be
+        # trimmed along with the whole argument, and parking the padding
+        # inside the sentinel would put it out of reach of the whitespace
+        # collapse and double a space in the search column.
+        if not reading or not base:
+            return m.group(1)
+        return RUBY_OPEN + base + RUBY_SEP + reading + RUBY_CLOSE
+
+    return RUBY_RE.sub(park, text)
+
+
+def _render_ruby(text, html):
+    """Resolve parked furigana into the shape each column wants.
+
+    HTML gets `<ruby>base<rt>reading</rt></ruby>`; the search column keeps the
+    base alone, so a search for 翠耀石 still hits and the reading does not
+    pollute the text. Matches what games 1-10 already emit.
+    """
+    if html:
+        text = RUBY_MARK_RE.sub(r'<ruby>\1<rt>\2</rt></ruby>', text)
+    else:
+        text = RUBY_MARK_RE.sub(r'\1', text)
+    # Belt and braces: a sentinel must never reach the database.
+    for ch in (RUBY_OPEN, RUBY_SEP, RUBY_CLOSE):
+        text = text.replace(ch, '')
+    return text
+
+
 def clean_text(lines, joiner):
     """Join dialogue lines. `_decode_dialogue` already strips <...> tags;
     this just joins + collapses whitespace for the search column."""
     text = joiner.join(line.strip() for line in lines if line.strip())
     if joiner == ' ':
         text = WHITESPACE_RE.sub(' ', text)
+    # Decompiler mismaps Shift-JIS NEC `♥` (0x87 0x9D) onto `㈱`
+    # (0x87 0x9F) — both bytes are CP932 NEC special chars and the
+    # lookup is off by one. Patch back here before emit.
+    text = text.replace('㈱', '♥')
+    text = _render_ruby(text, html=(joiner == '<br/>'))
     return text.strip()
 
 
@@ -573,6 +640,11 @@ def build_chr_alias(parsed_files, jp_tname, tvoice):
             if not fn or not fn.startswith('v'):
                 continue
             prefix = fn[:4]
+            # Sentinel chr_ids (0xFFFF "Overlord Auguste" etc.) appear in
+            # t_name but are debug placeholders — exclude from the bridge
+            # so they don't hijack voice-prefix attribution.
+            if chr_id in ANONYMOUS_CHR_IDS:
+                continue
             if chr_id in jp_tname:
                 prefix_known.setdefault(prefix, Counter())[chr_id] += 1
             elif chr_id is not None:
@@ -632,7 +704,26 @@ def main():
         val = entry.get(side_field) or entry.get('name') or ''
         return val.strip()
 
-    def portrait(chr_id, voice_id=None):
+    def _check_mask(chr_id, tier, override_en, override_jp):
+        # Suppress only when chr_set_display_name masks a named character's
+        # avfc face. Generic btlface combat models match override roles
+        # (Mafioso/Gangster/etc.) legitimately, so leave those alone.
+        if tier != 'face':
+            return False
+        overrides = {(o or '').strip() for o in (override_en, override_jp)}
+        overrides.discard('')
+        if not overrides:
+            return False
+        real = set()
+        for src in (en_tname.get(chr_id), jp_tname.get(chr_id)):
+            if not src:
+                continue
+            real.add((src.get('name') or '').strip())
+            real.add((src.get('full_name_en') or '').strip())
+        real.discard('')
+        return not (overrides & real)
+
+    def portrait(chr_id, voice_id=None, override_en='', override_jp=''):
         if chr_id in ANONYMOUS_CHR_IDS:
             return None, None
         if chr_id is None:
@@ -645,12 +736,18 @@ def main():
             if known_cid is None:
                 return None, None
             entry = jp_tname.get(known_cid) or en_tname.get(known_cid)
-            return portrait_for(entry)
+            pf, tier = portrait_for(entry)
+            if _check_mask(known_cid, tier, override_en, override_jp):
+                return None, None
+            return pf, tier
         entry = jp_tname.get(chr_id) or en_tname.get(chr_id)
         if not entry and chr_id in chr_alias:
             aliased = chr_alias[chr_id]
             entry = jp_tname.get(aliased) or en_tname.get(aliased)
-        return portrait_for(entry)
+        pf, tier = portrait_for(entry)
+        if _check_mask(chr_id, tier, override_en, override_jp):
+            return None, None
+        return pf, tier
 
     rows = []
     stems = sorted(set(en_files) | set(jp_files))
@@ -681,7 +778,9 @@ def main():
             jpn_chr = speaker(jp_chr if jp_t else chr_id, jp_override,
                               jp_tname, 'name', voice_id=vid)
 
-            pfile, tier = portrait(chr_id, voice_id=vid)
+            pfile, tier = portrait(chr_id, voice_id=vid,
+                                   override_en=en_override,
+                                   override_jp=jp_override)
             pc_icon = pc_icon_html(pfile, tier)
 
             jp_html = clean_text(jp_lines, '<br/>')

@@ -14,11 +14,12 @@ import re
 import sys
 
 FALCOM_ROOT = os.path.join(os.path.expanduser('~'), 'Documents', 'programming', 'Falcom')
-EN_ROOT = os.path.join(FALCOM_ROOT, 'reverie_decompiled', 'data', 'scripts')
-JP_ROOT = os.path.join(FALCOM_ROOT, 'reverie_jp_decompiled', 'scripts')
-EN_TNAME = os.path.join(FALCOM_ROOT, 'reverie_decompiled', 'data', 'text', 'dat_en', 't_name.py')
-JP_TNAME = os.path.join(FALCOM_ROOT, 'reverie_jp_decompiled', 'data', 'text', 'dat', 't_name.py')
-JP_TVOICE = os.path.join(FALCOM_ROOT, 'reverie_jp_decompiled', 'data', 'text', 'dat', 't_voice.py')
+DATA_ROOT = os.path.join(FALCOM_ROOT, 'data')
+EN_ROOT = os.path.join(DATA_ROOT, 'reverie_decompiled', 'data', 'scripts')
+JP_ROOT = os.path.join(DATA_ROOT, 'reverie_jp_decompiled', 'scripts')
+EN_TNAME = os.path.join(DATA_ROOT, 'reverie_decompiled', 'data', 'text', 'dat_en', 't_name.py')
+JP_TNAME = os.path.join(DATA_ROOT, 'reverie_jp_decompiled', 'data', 'text', 'dat', 't_name.py')
+JP_TVOICE = os.path.join(DATA_ROOT, 'reverie_jp_decompiled', 'data', 'text', 'dat', 't_voice.py')
 CHRID_TABLE_PATH = os.path.join(FALCOM_ROOT, 'Decompiler2', 'Falcom', 'ED85', 'Metadata', 'chrId_table.py')
 GAME_ID = 10
 OUTPUT = 'reverie.sql'
@@ -121,6 +122,10 @@ CONTROL_CODE_RE = re.compile(r'#[A-Za-z](?:_[A-Za-z0-9]+|\[[A-Za-z0-9]+\])?')
 LEFTOVER_CODE_RE = re.compile(r'#\d+[A-Za-z]?')
 LEADING_DIGITS_RE = re.compile(r'^\d+')
 WHITESPACE_RE = re.compile(r'[ \t]+')
+# Ruby (furigana) markup: `Ⅶの輪#6RROUND OF SEVEN#` — digit before R is
+# the byte length of the preceding base text in Shift-JIS (each Japanese
+# char = 2 bytes); reading runs to the closing bare `#`.
+RUBY_RE = re.compile(r'#(\d+)R([^#]*)#')
 
 
 def _subscript_slice(node):
@@ -155,20 +160,52 @@ def _string_parts(node):
 
 
 def _extract_voice_id(node):
-    """Find a (TxtCtl.Voice, 0xNNNN) sub-tuple inside a ChrTalk/Talk's
-    content tuple. Returns the voice code or None. Only the first voice
-    tuple is used (one voice per dialogue, matching haji's output)."""
-    if not isinstance(node, (ast.Tuple, ast.List)):
-        return None
-    for elt in node.elts:
-        if not isinstance(elt, ast.Tuple) or len(elt.elts) < 2:
-            continue
-        head = elt.elts[0]
-        val = elt.elts[1]
-        if (isinstance(head, ast.Attribute) and head.attr == 'Voice'
-                and isinstance(val, ast.Constant) and isinstance(val.value, int)):
-            return val.value
+    """Backwards-compatible accessor: returns the first voice id in the
+    content tuple, or None. New code should use _extract_segments."""
+    for v, _ in _extract_segments(node):
+        if v is not None:
+            return v
     return None
+
+
+def _extract_segments(node):
+    """Walk a ChrTalk/Talk content tuple in source order and yield
+    (voice_id_or_None, [text_parts]) per paragraph. `(TxtCtl.Voice, N)`
+    opens a paragraph and sets its voice; `TxtCtl.Clear` ends one;
+    string literals accumulate into the current paragraph.
+
+    Multi-paragraph dialogue with one voice per paragraph (e.g. boss
+    speeches with three sequential voice IDs) becomes three segments —
+    main() voice-wraps each one independently so all audio links work
+    instead of only the first one playing."""
+    if not isinstance(node, (ast.Tuple, ast.List)):
+        return []
+    segments = []
+    cur_voice = None
+    cur_parts = []
+
+    def flush():
+        if cur_parts or cur_voice is not None:
+            segments.append((cur_voice, list(cur_parts)))
+
+    for elt in node.elts:
+        if isinstance(elt, ast.Tuple) and len(elt.elts) >= 2:
+            head, val = elt.elts[0], elt.elts[1]
+            if (isinstance(head, ast.Attribute) and head.attr == 'Voice'
+                    and isinstance(val, ast.Constant) and isinstance(val.value, int)):
+                flush()
+                cur_voice = val.value
+                cur_parts = []
+                continue
+        if isinstance(elt, ast.Attribute) and elt.attr == 'Clear':
+            flush()
+            cur_voice = None
+            cur_parts = []
+            continue
+        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+            cur_parts.append(elt.value)
+    flush()
+    return [(v, p) for v, p in segments if p or v is not None]
 
 
 def _is_scena_code_decorated(func):
@@ -235,12 +272,24 @@ def parse_script(path, chr_key_to_id):
     dialogues = []
     createchr_names = {}
     scene_idx = -1
+    # Latched OP_27 overrides persist ACROSS functions within a scena —
+    # this matches the game runtime, which holds these aliases until
+    # explicitly reassigned or the scena unloads. The clearest example
+    # is w1410: `OP_27('《Ｃ》', 0x002C)` in EV_C1_01_01 makes Rufus's
+    # chr_id render as "《Ｃ》" for the rest of the scena (including
+    # subsequent functions like EV_C2_00_01). Resetting per-function
+    # would lose that masked-identity alias on every line outside the
+    # function it was first set in.
+    latched = {}
+    pending_anon = ''      # OP_27 with 0xFFFF: consumed by next dialogue
     for node in tree.body:
         if not (isinstance(node, ast.FunctionDef) and _is_scena_code_decorated(node)):
             continue
         scene_idx += 1
-        latched = {}       # chr_id -> name (persists until re-overwritten)
-        pending_anon = ''  # OP_27 with 0xFFFF: consumed by next dialogue
+        # New function: clear the single-shot pending_anon (a one-shot
+        # bound to the very next dialogue can't survive a function
+        # boundary) but preserve the persistent latched dict.
+        pending_anon = ''
         for call in _iter_calls_in_order(node):
             if not isinstance(call.func, ast.Name):
                 continue
@@ -250,33 +299,40 @@ def parse_script(path, chr_key_to_id):
                 if not (isinstance(n_arg, ast.Constant) and isinstance(n_arg.value, str)):
                     continue
                 sval = n_arg.value
-                if not sval.strip():
-                    continue
                 if isinstance(id_arg, ast.Constant) and isinstance(id_arg.value, int):
                     if id_arg.value in (0xFFFF, 0xFFFE):
-                        pending_anon = sval
-                    else:
+                        # Single-shot anonymous label; an empty name is a
+                        # no-op (pending_anon is cleared by the next line).
+                        if sval.strip():
+                            pending_anon = sval
+                    elif sval.strip():
                         latched[id_arg.value] = sval
+                    else:
+                        # Empty name = reset this chr_id's latch to the
+                        # real t_name; clear it instead of ignoring it.
+                        latched.pop(id_arg.value, None)
             elif name == 'ChrTalk' and len(call.args) >= 3:
                 char = _parse_char_arg(call.args[0])
-                parts = _string_parts(call.args[2])
-                voice = _extract_voice_id(call.args[2])
+                segments = _extract_segments(call.args[2])
+                parts = [s for _, ps in segments for s in ps]
+                voice = next((v for v, _ in segments if v is not None), None)
                 override = pending_anon
                 if not override and char is not None:
                     chrid = char[1] if char[0] == 'id' else chr_key_to_id.get(char[1])
                     if chrid is not None:
                         override = latched.get(chrid, '')
                 pending_anon = ''
-                dialogues.append((scene_idx, char, parts, 'chr', override, voice))
+                dialogues.append((scene_idx, char, parts, 'chr', override, voice, segments))
             elif name == 'Talk' and len(call.args) >= 2:
-                parts = _string_parts(call.args[1])
+                segments = _extract_segments(call.args[1])
+                parts = [s for _, ps in segments for s in ps]
                 if is_animation_trigger(parts):
                     pending_anon = ''
                     continue
-                voice = _extract_voice_id(call.args[1])
+                voice = next((v for v, _ in segments if v is not None), None)
                 override = pending_anon
                 pending_anon = ''
-                dialogues.append((scene_idx, None, parts, 'anon', override, voice))
+                dialogues.append((scene_idx, None, parts, 'anon', override, voice, segments))
             elif name == 'CreateChr' and len(call.args) >= 3:
                 char = _parse_char_arg(call.args[0])
                 if char is None:
@@ -302,7 +358,7 @@ def parse_script(path, chr_key_to_id):
     prev_sig = None
     prev_voiced = False
     for d in dialogues:
-        scene, char, parts, dkind, override, voice = d
+        scene, char, parts, dkind, override, voice, _segs = d
         is_voiced = voice is not None
         if char is not None and parts and is_voiced:
             sig = (scene, char, tuple(parts), dkind)
@@ -351,6 +407,36 @@ def voice_wrap(html_text, voice_file):
         f'data-audio="talk/10/{voice_file}.opus">'
         f'{html_text}</a>'
     )
+
+
+def render_html_segments(segments, tvoice=None):
+    """Render (voice_id, [parts]) segments into HTML. Each paragraph
+    is independently voice-wrapped (when `tvoice` is given and the
+    segment has a voice id), then joined with `<br/><br/>` to mirror
+    the original paragraph breaks. Pass `tvoice=None` for sides without
+    voice (EN)."""
+    pieces = []
+    for vid, parts in segments:
+        text = clean_text(parts, '<br/>')
+        if not text:
+            continue
+        if tvoice is not None and vid is not None:
+            vfile = tvoice.get(vid)
+            if vfile:
+                text = voice_wrap(text, vfile)
+        pieces.append(text)
+    return '<br/><br/>'.join(pieces)
+
+
+def render_search_segments(segments):
+    """Plain-text version: paragraphs joined with a single space so
+    'Sentence one.' and 'Sentence two.' don't get glued together."""
+    pieces = []
+    for _vid, parts in segments:
+        text = clean_text(parts, ' ')
+        if text:
+            pieces.append(text)
+    return ' '.join(pieces)
 
 
 def load_chrid_table(path):
@@ -434,13 +520,58 @@ def portrait_from_tname(entry):
     return None
 
 
+def _ruby_base_start(text, end_pos, byte_count):
+    """Walk backward from `end_pos` consuming Shift-JIS bytes until we
+    hit `byte_count`. CS-era ruby `#NR...#` encodes N as the byte length
+    of the preceding text in Shift-JIS (each Japanese char = 2 bytes)."""
+    consumed = 0
+    i = end_pos
+    while i > 0 and consumed < byte_count:
+        ch = text[i - 1]
+        try:
+            consumed += len(ch.encode('cp932'))
+        except UnicodeEncodeError:
+            consumed += 2
+        i -= 1
+    return i
+
+
+def _apply_ruby(text, html):
+    """Resolve `<base>#NR<reading>#` ruby markup. For HTML output, wrap
+    base+reading in `<ruby>` tags. For plain text, drop the marker — the
+    base remains because it's written before the marker."""
+    while True:
+        m = RUBY_RE.search(text)
+        if not m:
+            return text
+        count = int(m.group(1))
+        reading = m.group(2)
+        if count == 0:
+            text = text[:m.start()] + text[m.end():]
+            continue
+        base_start = _ruby_base_start(text, m.start(), count)
+        if html and reading:
+            base = text[base_start:m.start()]
+            repl = f'<ruby>{base}<rt>{reading}</rt></ruby>'
+            text = text[:base_start] + repl + text[m.end():]
+        else:
+            text = text[:m.start()] + text[m.end():]
+
+
 def clean_text(parts, newline):
     text = ''.join(parts)
+    # Ruby must run before LEFTOVER_CODE_RE strips the `#NR` opener and
+    # orphans the reading + closing `#`.
+    text = _apply_ruby(text, html=(newline == '<br/>'))
     text = CONTROL_CODE_RE.sub('', text)
     text = LEFTOVER_CODE_RE.sub('', text)
     text = text.replace('\n', newline)
     if newline == ' ':
         text = WHITESPACE_RE.sub(' ', text)
+    # Decompiler mismaps Shift-JIS NEC `♥` (0x87 0x9D) onto `㈱`
+    # (0x87 0x9F) — both bytes are CP932 NEC special chars and the
+    # lookup is off by one. Patch back here before emit.
+    text = text.replace('㈱', '♥')
     return text.strip()
 
 
@@ -493,7 +624,7 @@ def build_chr_alias(parsed_files, jp_tname, chr_key_to_id, tvoice):
     prefix_known = {}
     for parsed in parsed_files:
         for d in parsed:
-            scene, char, parts, dkind, override, voice = d
+            scene, char, parts, dkind, override, voice, _segs = d
             if voice is None or char is None:
                 continue
             if char[0] == 'id':
@@ -738,13 +869,13 @@ def main():
 
             for en_t, jp_t in pairs:
                 if en_t:
-                    en_scene, en_char, en_parts, _en_kind, en_override, en_voice = en_t
+                    en_scene, en_char, en_parts, _en_kind, en_override, en_voice, en_segs = en_t
                 else:
-                    en_scene, en_char, en_parts, en_override, en_voice = None, None, [], '', None
+                    en_scene, en_char, en_parts, en_override, en_voice, en_segs = None, None, [], '', None, []
                 if jp_t:
-                    jp_scene, jp_char, jp_parts, _jp_kind, jp_override, jp_voice = jp_t
+                    jp_scene, jp_char, jp_parts, _jp_kind, jp_override, jp_voice, jp_segs = jp_t
                 else:
-                    jp_scene, jp_char, jp_parts, jp_override, jp_voice = None, None, [], '', None
+                    jp_scene, jp_char, jp_parts, jp_override, jp_voice, jp_segs = None, None, [], '', None, []
                 scene = jp_scene if jp_scene is not None else (en_scene if en_scene is not None else 0)
 
                 vid = jp_voice or en_voice
@@ -765,6 +896,13 @@ def main():
 
                 pfile = (row_portrait(jp_char, talk_fb, voice_id=vid)
                          or row_portrait(en_char, talk_fb, voice_id=vid))
+                # Masked-Rufus override: when an OP_27 latch has aliased
+                # Rufus (chr_id 0x002C) to '《Ｃ》' / 'C', use the masked
+                # face sprite (avfc112.webp) instead of his unmasked one
+                # (avfc112_c00.webp). Reverie ships only those two
+                # Rufus-related sprites so this is a hard mapping.
+                if pfile == 'avfc112_c00.webp' and (jp_raw == '《Ｃ》' or en_raw == 'C'):
+                    pfile = 'avfc112.webp'
                 if pfile:
                     pc_icon = f'<img class="itp-face3" src="itp/10/{pfile}"/>'
                 else:
@@ -772,21 +910,18 @@ def main():
                              or row_note(en_char, talk_fb, voice_id=vid))
                     pc_icon = f'<img class="itp-note3" src="itp/10/{nfile}"/>' if nfile else ''
 
-                jp_html = clean_text(jp_parts, '<br/>')
-                # Voice: JP audio file wraps the JP HTML. EN and JP use the
-                # same voice code for the same dialogue — prefer JP but
-                # accept EN's voice id as fallback (pairing is positional).
-                vfile = tvoice.get(vid) if vid is not None else None
-                if vfile and jp_html:
-                    jp_html = voice_wrap(jp_html, vfile)
+                en_search = render_search_segments(en_segs) if en_segs else clean_text(en_parts, ' ')
+                en_html = render_html_segments(en_segs) if en_segs else clean_text(en_parts, '<br/>')
+                jp_search = render_search_segments(jp_segs) if jp_segs else clean_text(jp_parts, ' ')
+                jp_html = render_html_segments(jp_segs, tvoice) if jp_segs else clean_text(jp_parts, '<br/>')
 
                 rows.append([
                     str(GAME_ID), stem, str(scene), str(rownum),
                     eng_chr,
-                    clean_text(en_parts, ' '),
-                    clean_text(en_parts, '<br/>'),
+                    en_search,
+                    en_html,
                     jpn_chr,
-                    clean_text(jp_parts, ' '),
+                    jp_search,
                     jp_html,
                     '', pc_icon,
                 ])

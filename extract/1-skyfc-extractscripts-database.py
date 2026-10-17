@@ -1153,6 +1153,7 @@ def main():
                     # pages = eng_lines2
                     evo_icons = []
                     pc_icons = []
+                    voice_ids = []  # per-page voice id; None if page has no audio
 
                     # print(i,full_eng_lines[i])
                     pc_icon = re.finditer(rb'#(\d+?)F', fullEngLines[i])
@@ -1175,12 +1176,7 @@ def main():
                         voice = re.search(rb'#(\d+?)V', pages[j])
                         evo_icon = re.search(rb'#(\d+?)F', pages[j])
 
-                        if voice:
-                            # print('a voice!!!')
-                            pages[j] = b'<a href="javascript:void(0)" class="dialogue-line" ' \
-                                       b'data-audio="talk/1/ch%s.ogg">%s</a>' \
-                                       % (voice.group(1), pages[j])
-                            # print(pages[j])
+                        voice_ids.append(voice.group(1).decode(jpn_encode) if voice else None)
                         if evo_icon:
                             icon_index = int(evo_icon.group(1).decode(jpn_encode))
                             if len(str(icon_index)) <= 3:
@@ -1191,6 +1187,19 @@ def main():
                                 icon_str = '<img class="itp" src="itp/1/evo/c_ka%s.webp"/> ' \
                                            % icon_index
                             evo_icons.append(icon_str)
+
+                    # Wrap jpn_html_text pages with audio anchors using voice_ids
+                    # collected from the eng-side pages (positionally aligned).
+                    if any(voice_ids):
+                        jpn_pages_split = jpn_html_text.split('<br/><br/>')
+                        for j in range(min(len(voice_ids), len(jpn_pages_split))):
+                            if voice_ids[j]:
+                                jpn_pages_split[j] = (
+                                    '<a href="javascript:void(0)" class="dialogue-line" '
+                                    'data-audio="talk/1/ch%s.ogg">%s</a>'
+                                    % (voice_ids[j], jpn_pages_split[j])
+                                )
+                        jpn_html_text = '<br/><br/>'.join(jpn_pages_split)
 
                     if eng_npc_name is not None:
                         eng_chr_name = eng_npc_name
