@@ -1,0 +1,12 @@
+*.pyc
+
+# Claude Code runtime files
+.claude/
+
+# Generated extractor output (re-run the extract/ scripts to rebuild).
+# The hand-written game-row inserts stay tracked.
+extract/*.sql
+!extract/*-game.sql
+extract/*-diff.html
+extract/*-diff.txt
+extract/haji.txt
