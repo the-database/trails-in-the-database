@@ -94,6 +94,7 @@ alone in the search columns.
 
 ## In-game books
 
-`kuro-extractbooks-database.py` (Daybreak I/II, Horizon, Sky 1st/2nd) and
-`ed7-extractbooks-database.py` (Zero, Azure) describe their own inputs and
-staging steps in their docstrings.
+`kuro-extractbooks-database.py` (Daybreak I/II, Horizon, Sky 1st/2nd),
+`ed7-extractbooks-database.py` (Zero, Azure), `ed6-extractbooks-database.py`
+(Sky FC/SC/3rd) and `ed8-extractbooks-database.py` (Cold Steel I-IV) describe
+their own inputs and staging steps in their docstrings.
