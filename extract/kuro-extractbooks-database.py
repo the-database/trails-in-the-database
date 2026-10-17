@@ -23,7 +23,8 @@ t_books.tbl:
   t_notemenu.tbl NoteBooksMenu {note_text, long1 = category} in the others.
 EN and JP share BooksTitle but not page counts, so pages are stored per
 language. Every BooksTitle row is emitted, including the Sky 1st library that
-Sky 2nd carries over, so each game's list is what that game ships.
+Sky 2nd carries over, so each game's list is what that game ships; those
+carried-over books keep their Sky 1st category (see PREVIOUS).
 Daybreak II's BooksTitleReplace only swaps a texture for book 106 and is
 ignored.
 
@@ -49,7 +50,15 @@ GAMES = {
 }
 
 # Sky 2nd files its carried-over Sky 1st books under category 2, which its own
-# BooksCategory doesn't define; that slot is "Other" in Sky 1st.
+# BooksCategory doesn't define. Those books take the category Sky 1st gives the
+# same book id; where that name is also one of the game's own categories (Liberl
+# News), the suffix keeps the carried-over issues from merging into the game's
+# own run of the same series. Books in an undefined category with no
+# counterpart get FALLBACK_CATEGORY (Sky 1st's name for category 2).
+PREVIOUS = {
+    # game: (staged dir of the game it carries books over from, EN suffix, JP suffix)
+    'sky2r': ('sky1', ' (1st Chapter)', '（the 1st）'),
+}
 FALLBACK_CATEGORY = ('Other', 'その他')
 
 # Furigana: `<R>base</Rreading>`. Same handling as the dialogue extractors
@@ -150,12 +159,29 @@ def main():
     assert [t['id'] for t in eng['titles']] == [t['id'] for t in jpn['titles']], 'EN/JP BooksTitle differ'
     jpn_titles = {t['id']: t for t in jpn['titles']}
 
+    previous = {}
+    suffix_eng = suffix_jpn = ''
+    if sys.argv[1] in PREVIOUS:
+        prev_staged, suffix_eng, suffix_jpn = PREVIOUS[sys.argv[1]]
+        prev_dir = os.path.join(ROOT, prev_staged)
+        for lang, sub in (('eng', 'en'), ('jpn', 'jp')):
+            tables = load_tables(os.path.join(prev_dir, sub, 't_books.json'))
+            previous[lang] = ({t['id']: t['int1'] for t in tables['BooksTitle']},
+                              categories(prev_dir, sub, tables))
+
     books = []
     for t in eng['titles']:
         jt = jpn_titles[t['id']]
         cat = t['int1']
         if cat in eng['categories']:
             series_eng, series_jpn = eng['categories'][cat], jpn['categories'].get(cat)
+        elif previous and t['id'] in previous['eng'][0]:
+            prev_cat = previous['eng'][0][t['id']]
+            series_eng = previous['eng'][1][prev_cat]
+            series_jpn = previous['jpn'][1][prev_cat]
+            if series_eng in eng['categories'].values():
+                series_eng += suffix_eng
+                series_jpn += suffix_jpn
         else:
             series_eng, series_jpn = FALLBACK_CATEGORY
         books.append({
