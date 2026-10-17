@@ -57,7 +57,8 @@ SERIES = [
     ('Sunshine Agnès', 'Sunshine Agnès', '陽溜りのアニエス'),
 ]
 
-CODE_RE = re.compile(rb'#(\d*)([A-Za-z])')
+# Layout offsets can be negative (`#-8y`).
+CODE_RE = re.compile(rb'#(-?\d*)([A-Za-z])')
 # Sentinels for parked furigana; control bytes never survive into page text.
 RUBY_OPEN, RUBY_SEP, RUBY_CLOSE = '\x11', '\x12', '\x13'
 RUBY_MARK_RE = re.compile('\x11([^\x11-\x13]*)\x12([^\x11-\x13]*)\x13')
@@ -72,6 +73,16 @@ WHITESPACE_RE = re.compile(r'[ \t　]+')
 
 def is_sjis_lead(b):
     return 0x81 <= b <= 0x9F or 0xE0 <= b <= 0xFC
+
+
+def char_boundary(line, start):
+    """First cp932 character boundary at or after byte `start` of `line`.
+    A furigana base is given as a byte count, which can land inside a
+    double-byte character when the base mixes in half-width spaces."""
+    i = 0
+    while i < max(start, 0):
+        i += 2 if is_sjis_lead(line[i]) and i + 1 < len(line) else 1
+    return i
 
 
 def read_entries(path):
@@ -114,9 +125,9 @@ def split_pages(body):
             if m.group(2) == b'R':
                 end = body.index(b'#', m.end())
                 reading = body[m.end():end]
-                count = min(int(m.group(1) or 0), len(line))
-                base = bytes(line[len(line) - count:])
-                del line[len(line) - count:]
+                start = char_boundary(line, len(line) - int(m.group(1) or 0))
+                base = bytes(line[start:])
+                del line[start:]
                 line += (RUBY_OPEN.encode() + base + RUBY_SEP.encode()
                          + reading + RUBY_CLOSE.encode())
                 i = end + 1
