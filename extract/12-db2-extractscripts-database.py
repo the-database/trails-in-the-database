@@ -7,6 +7,10 @@ Each top-level `fn name()` is a scene. Line-number labels (`NNN@`) are
 stripped before parsing. Each interesting call is extracted with balanced-
 paren scanning and parsed via `ast.parse` (the calls themselves are valid
 Python once labels are stripped).
+
+Active voice (the party banter that plays on the field) comes from
+t_active_voice.tbl and goes in as one more file, `active_voice`; see
+active_voice_exchanges.
 """
 
 import ast
@@ -23,6 +27,17 @@ JP_TNAME = os.path.join(DB2_ROOT, 'jp_json', 't_name.json')
 JP_TVOICE = os.path.join(DB2_ROOT, 'jp_json', 't_voice.json')
 GAME_ID = 12
 OUTPUT = 'db2.sql'
+
+# t_active_voice.tbl from the Steam release, staged with the books under
+# KuroTools/books_20261017 (see kuro-extractbooks-database.py) and converted
+# with `python tbl2json.py t_active_voice.tbl`.
+ACTIVE_VOICE_ROOT = os.path.join(os.path.expanduser('~'), 'Documents', 'programming', 'KuroTools', 'books_20261017', 'daybreak2')
+EN_ACTIVE = os.path.join(ACTIVE_VOICE_ROOT, 'en', 't_active_voice.json')
+JP_ACTIVE = os.path.join(ACTIVE_VOICE_ROOT, 'jp', 't_active_voice.json')
+ACTIVE_VOICE_FNAME = 'active_voice'
+# Groups from here up are test entries after the game's own, never played:
+# 'Test 1' / 'Test 2' and a few sample exchanges.
+ACTIVE_VOICE_TEST_GROUPS = 99990
 
 # 0xFFFE / 0xFFFF are engine sentinels for anonymous narration. t_name.json
 # has a stray entry mapping 65535 to "Overlord Auguste"/chr0298, so looking
@@ -628,6 +643,46 @@ def build_chr_alias(parsed_files, jp_tname, tvoice):
     return alias, voice_prefix_to_known
 
 
+def load_active_voice(path):
+    """ActiveVoiceTableData rows in table order, as
+    (group, chr_ids, voice_id, text).
+    int1 is the speaker's chr_id, long2 the t_voice id (0 = unvoiced)."""
+    with open(path, 'r', encoding='utf-8') as f:
+        doc = json.load(f)
+    out = []
+    for block in doc.get('data', []):
+        for r in block.get('data', []):
+            out.append((r['id'], [r['int1']], r['long2'] or None, r['voice_subtitle']))
+    return out
+
+
+def active_voice_exchanges():
+    """Pair EN/JP active voice rows and group them into exchanges (the
+    table's `id`), in table order. Variants of one exchange for different
+    triggers repeat its lines, so a line (speaker, voice, text) is emitted
+    once, in the first exchange that plays it. Rows with no text are
+    dropped, and so are the test groups (ACTIVE_VOICE_TEST_GROUPS)."""
+    en = load_active_voice(EN_ACTIVE)
+    jp = load_active_voice(JP_ACTIVE)
+    assert [r[:3] for r in en] == [r[:3] for r in jp], 'EN/JP active voice tables differ'
+    groups = {}
+    seen = set()
+    for e, j in zip(en, jp):
+        group, chr_ids, voice_id, text = e
+        if group >= ACTIVE_VOICE_TEST_GROUPS or not (text.strip() or j[3].strip()):
+            continue
+        key = (tuple(chr_ids), voice_id, text)
+        if key in seen:
+            continue
+        seen.add(key)
+        groups.setdefault(group, []).append((e, j))
+    return list(groups.values())
+
+
+def active_voice_lines(text):
+    return [ANGLE_TAG_RE.sub('', _mark_ruby(line)).strip() for line in text.split('\n')]
+
+
 def main():
     en_files = collect_files(EN_ROOT)
     jp_files = collect_files(JP_ROOT)
@@ -766,6 +821,44 @@ def main():
                 '', pc_icon,
             ])
             rownum += 1
+
+    # Active voice: one exchange per scene, after the scripts. A single
+    # speaker is named by chr_id, or -- for the anonymous ids and ids t_name
+    # doesn't know (bosses) -- by the voice clip's actor prefix, as the
+    # scripts do. Lines several speakers say together ('Yeah!') get the
+    # scripts' joint-speaker form, 'A & B'.
+    rownum = 1
+    for scene, exchange in enumerate(active_voice_exchanges(), start=1):
+        for (_, chr_ids, vid, en_text), (_, _, _, jp_text) in exchange:
+            if len(chr_ids) == 1:
+                cid = chr_ids[0]
+                if cid in ANONYMOUS_CHR_IDS or not (cid in en_tname or cid in chr_alias):
+                    cid = None
+                eng_chr = speaker(cid, '', en_tname, 'name', voice_id=vid)
+                jpn_chr = speaker(cid, '', jp_tname, 'name', voice_id=vid)
+                pc_icon = pc_icon_html(*portrait(cid, voice_id=vid))
+            else:
+                eng_chr = ' & '.join(n for n in (speaker(c, '', en_tname, 'name') for c in chr_ids) if n)
+                jpn_chr = '＆'.join(n for n in (speaker(c, '', jp_tname, 'name') for c in chr_ids) if n)
+                pc_icon = ''
+            en_lines = active_voice_lines(en_text)
+            jp_lines = active_voice_lines(jp_text)
+            jp_html = clean_text(jp_lines, '<br/>')
+            vfile = tvoice.get(vid) if vid is not None else None
+            if vfile and jp_html:
+                jp_html = voice_wrap(jp_html, vfile)
+            rows.append([
+                str(GAME_ID), ACTIVE_VOICE_FNAME, str(scene), str(rownum),
+                eng_chr,
+                clean_text(en_lines, ' '),
+                clean_text(en_lines, '<br/>'),
+                jpn_chr,
+                clean_text(jp_lines, ' '),
+                jp_html,
+                '', pc_icon,
+            ])
+            rownum += 1
+    print(f'active voice  rows={rownum - 1}')
 
     with open(OUTPUT, 'w', encoding='utf-8') as f:
         f.write(f'delete from script where game_id = {GAME_ID};\n')

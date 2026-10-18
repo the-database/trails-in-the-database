@@ -6,11 +6,16 @@ walk only). Extracts both ChrTalk(...) (speaker-tagged) and Talk(0xFFFF, ...)
 EN and JP rows are paired by position within each file. Character display
 names come from CreateChr calls in scena files, keyed by the Chinese
 ChrTable key shared between EN and JP decompiles.
+
+Active voice (the party banter that plays on the field) comes from
+t_active.tbl and goes in as one more file, `active_voice`; see
+active_voice_exchanges.
 """
 
 import ast
 import os
 import re
+import sqlite3
 import sys
 
 FALCOM_ROOT = os.path.join(os.path.expanduser('~'), 'Documents', 'programming', 'Falcom')
@@ -23,6 +28,19 @@ JP_TVOICE = os.path.join(DATA_ROOT, 'reverie_jp_decompiled', 'data', 'text', 'da
 CHRID_TABLE_PATH = os.path.join(FALCOM_ROOT, 'Decompiler2', 'Falcom', 'ED85', 'Metadata', 'chrId_table.py')
 GAME_ID = 10
 OUTPUT = 'reverie.sql'
+
+# t_active.tbl, staged with the books (see ed8-extractbooks-database.py):
+# EN from the Steam release, JP from Hajimari no Kiseki v1.0, CLE-decrypted
+# into text/decrypted/dat. Converted with tocs' sqlite_conv (`--game CS5`).
+ACTIVE_VOICE_ROOT = os.path.join(os.path.expanduser('~'), 'Documents', 'programming', 'books_raw', 'reverie', 'text')
+EN_ACTIVE = os.path.join(ACTIVE_VOICE_ROOT, 'dat_en', 't_active.sqlite')
+JP_ACTIVE = os.path.join(ACTIVE_VOICE_ROOT, 'decrypted', 'dat', 't_active.sqlite')
+ACTIVE_VOICE_FNAME = 'active_voice'
+# Groups from here up are test entries after the game's own, never played:
+# a line per portrait that only reads the character's name (JP with dev
+# notes such as 「本校制服、ユウナの夢で使用」), and placeholder lines
+# (「ほげほげ」).
+ACTIVE_VOICE_TEST_GROUPS = 9990
 
 # Template/system files that haji omitted. Their ChrTalks are boilerplate.
 SKIP_STEMS = {'PersonalTemplate', 'be0000', 'infsys'}
@@ -696,6 +714,50 @@ def align_scenes(en_d, jp_d):
     return aligned
 
 
+def load_active_voice(db_path):
+    """ActiveVoiceTableData rows in table order, as
+    (group, row, line, portrait, voice_id, chr_id, text)."""
+    c = sqlite3.connect(db_path)
+    cur = c.execute(
+        "SELECT unknown_short_1, unknown_short_2, unknown_short_3, portrait, id, character, text "
+        "FROM ActiveVoiceTableData ORDER BY rowid"
+    )
+    out = cur.fetchall()
+    c.close()
+    return out
+
+
+def active_voice_exchanges():
+    """Pair EN/JP active voice rows and group them into exchanges.
+
+    The table lists each exchange as (group, row, line) entries. A row --
+    one voiced line -- can be listed under several groups (the same
+    banter triggered from different spots) or twice in one, so each row
+    is emitted once, in the first exchange that plays it. Exchanges keep
+    the table's order, which follows the story; group numbers don't.
+    `◆` / `◆st` / `◆end` rows are markers with no text."""
+    en = load_active_voice(EN_ACTIVE)
+    jp = load_active_voice(JP_ACTIVE)
+    assert [r[:6] for r in en] == [r[:6] for r in jp], 'EN/JP active voice tables differ'
+    groups = {}
+    for e, j in zip(en, jp):
+        if e[0] >= ACTIVE_VOICE_TEST_GROUPS:
+            continue
+        groups.setdefault(e[0], []).append((e, j))
+    exchanges = []
+    seen = set()
+    for entries in groups.values():
+        exchange = []
+        for e, j in sorted(entries, key=lambda p: p[0][2]):
+            if e[1] in seen or e[6].startswith('◆'):
+                continue
+            seen.add(e[1])
+            exchange.append((e, j))
+        if exchange:
+            exchanges.append(exchange)
+    return exchanges
+
+
 def main():
     en_scena = collect_files(EN_ROOT, 'scena', 'dat_en')
     jp_scena = collect_files(JP_ROOT, 'scena', 'dat')
@@ -927,6 +989,41 @@ def main():
                 ])
                 rownum += 1
         print(f'done {kind}  rows={len(rows)}')
+
+    # Active voice: one exchange per scene. The row's own portrait
+    # (I_AVFC042 -> avfc042.webp) is what the game shows beside the line.
+    rownum = 1
+    for scene, exchange in enumerate(active_voice_exchanges(), start=1):
+        for en_av, jp_av in exchange:
+            _, _, _, portrait, vid, cid, en_text = en_av
+            jp_text = jp_av[6]
+            char = ('id', cid)
+            eng_chr = normalize_name(en_tname.get(cid, {}).get('name', ''))
+            jpn_chr = normalize_name(jp_tname.get(cid, {}).get('name', ''))
+            jp_html = clean_text([jp_text], '<br/>')
+            vfile = tvoice.get(vid)
+            if vfile:
+                jp_html = voice_wrap(jp_html, vfile)
+            pfile = portrait[len('I_'):].lower() + '.webp'
+            if pfile not in AVAILABLE_PORTRAITS:
+                pfile = row_portrait(char, None)
+            if pfile:
+                pc_icon = f'<img class="itp-face3" src="itp/10/{pfile}"/>'
+            else:
+                nfile = row_note(char, None)
+                pc_icon = f'<img class="itp-note3" src="itp/10/{nfile}"/>' if nfile else ''
+            rows.append([
+                str(GAME_ID), ACTIVE_VOICE_FNAME, str(scene), str(rownum),
+                eng_chr,
+                clean_text([en_text], ' '),
+                clean_text([en_text], '<br/>'),
+                jpn_chr,
+                clean_text([jp_text], ' '),
+                jp_html,
+                '', pc_icon,
+            ])
+            rownum += 1
+    print(f'done active voice  rows={rownum - 1}')
 
     with open(OUTPUT, 'w', encoding='utf-8') as f:
         f.write(f'delete from script where game_id = {GAME_ID};\n')
